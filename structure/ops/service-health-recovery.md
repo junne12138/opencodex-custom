@@ -51,10 +51,11 @@ stop; a drain that began during startup prevents the spawn (`didRunDrainStartHoo
   (wall-clock lag monitor, so sleep counts) voids the streak.
 
 `src/service/health-sentinel-probe.ts` asks `/healthz` through `directLocalHttpFetch`.
+Probes accept only numeric IPv4/IPv6 destinations. Default and localhost binds use numeric loopback, as do wildcard binds; the wildcard test is the server's `isWildcardHostname` (`src/codex/loopback-target.ts`), so `*`, `0` and every all-zero spelling count. Other DNS bind names make the sentinel stand down without probing; the proxy remains available. The first normalized address and port remain pinned for the run, and runtime-record changes stand down both before probing and before termination.
 
 ## Binding the kill to the proxy
 
-`src/service/health-sentinel-main.ts` never kills a bare number:
+`src/service/health-sentinel-main.ts` selects the process binding before arming recovery:
 
 - Windows opens a kernel32 handle on the parent at startup through `bun:ffi`
   (`src/service/health-sentinel-windows.ts`), accepts it only if that process was created before the
@@ -65,14 +66,28 @@ stop; a drain that began during startup prevents the spawn (`didRunDrainStartHoo
   far enough that the new process appears to be older than the sentinel, the handle binds to that
   process and a later recovery would terminate it. A handle created by the proxy and inherited by
   the sentinel would close this gap; Bun's spawn does not offer one today.
-- POSIX checks the live `process.ppid` immediately before SIGKILL. SIGTERM cannot run on a stuck
-  loop and is a clean exit to systemd. This binding is probabilistic: if the sentinel is descheduled
-  between that check and `kill` while the parent exits, is reaped, and a new process receives the
-  same id, the signal reaches that process. Bun exposes no pidfd or process handle on POSIX.
+- Linux opens a pidfd through libc `syscall` using `bun:ffi`
+  (`src/service/health-sentinel-linux.ts`) on x64 and arm64, then checks that the watched PID is
+  still its live parent while holding the descriptor. A signal-zero call verifies signal support
+  and permissions before arming; the parent relationship is checked again afterward. Recovery
+  uses `pidfd_send_signal(SIGKILL)` on that descriptor, so PID reuse cannot redirect it. An exited
+  target (`ESRCH`) is skipped. A bound signal failure never falls back to a numeric PID.
+  `ENOSYS` from either startup syscall, or an unsupported syscall architecture, selects the existing
+  live-parent fallback and logs the limitation. Permission/resource/identity errors and unavailable
+  libc bindings refuse recovery. Both glibc and musl libc bindings are supported without new deps.
+  The watching line ends with `(pidfd)` when the binding succeeds.
+- macOS, and Linux without pidfd support, check the live `process.ppid` immediately before
+  SIGKILL. This fallback is probabilistic: if the sentinel is descheduled between the check and
+  `kill` while the parent exits, is reaped, and its PID is reused, the signal can reach that process.
+  SIGTERM cannot run on a stuck loop and is a clean exit to systemd.
 
-The final runtime-record re-read and the durable `intent` write run under the service ownership
+The runner releases its process owner in `finally`, including binding refusal, EOF, failed
+recovery and unexpected exceptions. Pidfd close is idempotent and prevents further signals;
+Linux close is never retried because a reused descriptor could name an unrelated object.
+
+The lease-held runtime-record re-read and the durable `intent` write run under the service ownership
 mutation lease (`src/service/ownership-mutation-lease.mjs`, 500 ms wait, no subprocess); a busy lease
-defers. Right before the kill the runner re-checks that the last failing observation is at most
+defers. After releasing the lease, the final runtime-record read precedes the evidence-age and target-exit checks, so time spent on that read cannot authorize termination on stale observations. Right before the kill the runner re-checks that the last failing observation is at most
 5 s old on the wall clock (and not in the future); older evidence is discarded, the `intent` entry is
 settled as `skipped`, and a fresh failing streak is required. The lease is released before the kill, because on Windows the sentinel may end with the
 proxy and a held lease would delay the replacement's startup. Every history write takes the lease.
@@ -89,3 +104,6 @@ replayed: requests the hung process held are lost as in a crash.
 phase-aligned recurring stalls), `-runner` (ordering, fail-closed paths, lease), `-launch` (gate,
 environment, drain hook, config admission) and `-process` (the real launcher and sentinel against a
 fixture that stops answering, on every CI OS).
+`tests/service/service-health-sentinel-linux.test.ts` covers injected syscall errors, reparenting
+during acquisition, PID reuse, already-exited targets, repeated recovery, teardown and descriptor
+cleanup. Linux additionally exercises the real FFI syscalls against a disposable process.

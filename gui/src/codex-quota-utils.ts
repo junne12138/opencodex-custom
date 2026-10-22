@@ -17,6 +17,7 @@ export interface AccountQuota {
     label: string;
     percent: number;
     resetAt?: number;
+    modelId?: string;
     limit?: number;
     used?: number;
     remaining?: number;

@@ -2,20 +2,7 @@
 
 Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts.
 
-The client-integration subsystem writes one generated OpenCodex provider contribution into a
-third-party client's existing config without taking ownership of the rest of that file. Its core
-promise is reversibility: apply snapshots first, writes atomically, records exactly what it owns,
-and refuses refresh, disable, or restore when the current file cannot be classified safely.
-Managed client targets are inspected without following a final symbolic link, and their atomic
-replacement addresses the named directory entry rather than resolving that link again at commit.
-Uninstall runs the same coordinated disable path for every strict ownership record before removing
-OpenCodex state, including the legacy Aside owner and every child profile store under
-`integrations/aside-profiles/<profileId>/`. `src/cli/uninstall-integrations.ts` validates all stores
-and registered Aside paths before mutation; `src/integrations/aside-profile-context.ts` supplies
-the guarded child stores. An unreadable record, conflict, or failed compensation aborts config
-removal and retains remaining recovery state. Earlier successful disables are not rolled back;
-failed compensation can leave an intermediate client file. Inspect the reported client files and
-retained snapshots before retrying; preserved recovery state does not prove restoration completed.
+The client-integration subsystem writes one generated OpenCodex provider contribution into a third-party client's existing config without taking ownership of the rest of that file. Its core promise is reversibility: apply snapshots first, writes atomically, records exactly what it owns, and refuses refresh, disable, or restore when the current file cannot be classified safely. Qoder specifics live in [`clients/qoder.md`](qoder.md). Managed client targets are inspected without following a final symbolic link, and their atomic replacement addresses the named directory entry rather than resolving that link again at commit. Uninstall runs the same coordinated disable path for every strict ownership record before removing OpenCodex state, including the legacy Aside owner and every child profile store under `integrations/aside-profiles/<profileId>/`. `src/cli/uninstall-integrations.ts` validates all stores and registered Aside paths before mutation; `src/integrations/aside-profile-context.ts` supplies the guarded child stores. An unreadable record, conflict, or failed compensation aborts config removal and retains remaining recovery state. Earlier successful disables are not rolled back; failed compensation can leave an intermediate client file. Inspect the reported client files and retained snapshots before retrying; preserved recovery state does not prove restoration completed.
 
 > Decision record: [ADR-0107](../decisions/ADR-0107-uninstall-integration-recovery.md)
 
@@ -31,7 +18,7 @@ parsing and ownership rules below.
 | `src/clients/config-export.ts` | Pure per-client config builders and the exact managed fragments each client receives. It never writes files. |
 | `src/integrations/registry.ts` | Canonical config/detection paths, current-provider-store declarations, source-preserving YAML declarations, writer-lock behavior, and client IDs. |
 | `src/integrations/target.ts` | Which file one operation reads, writes and records, and whether a write there reaches the client. |
-| `src/integrations/config-io.ts` | Bounded file loading and parsing. Values that cannot round-trip through the target serializer are rejected before mutation. |
+| `src/integrations/config-io.ts` | Bounded regular-file loading and parsing; production reads reject symlinks and stop after 4 MiB, and writes past the same bound are refused so a mutation cannot strand a file it cannot read back. `src/lib/bounded-file-read.ts` starts its buffer from the opened size and grows only as needed, retaining the limit-plus-one overflow probe when a file grows concurrently and returning only bytes actually read. Values that cannot round-trip through the target serializer are rejected before mutation. |
 | `src/integrations/kilo-candidates.ts` | Inspects all Kilo global config candidates for unsafe files and a competing `provider.opencodex` block before status or any operation that adds or replaces a block. |
 | `src/integrations/state.ts` | The single `absent` / `current` / `stale` / `conflict` / `unsafe` classifier used by status and every writer operation. |
 | `src/integrations/ownership.ts` | Durable ownership records: file, generated contribution, protected contribution, exact fragment paths, and operation identity. |
@@ -131,7 +118,7 @@ client registry + export context
   -> build managed contribution
   -> load and parse current config
   -> classify exact recorded fragments
-  -> snapshot prior bytes
+  -> snapshot prior bytes (on a size refusal before mutation, the store discards its unused snapshot by validated client/operation IDs; committed, owned, or uncertain evidence survives; report cleanup failures with its recovery path)
   -> merge or remove only recorded paths
   -> compare current bytes again
   -> atomic write
@@ -381,6 +368,7 @@ observed. Naming the store without the last three would be naming a file we cann
 
 ZCode resolves absolute `dataBaseDir` from the default-home `~/.zcode/v2/setting.json` through the caller's `IntegrationIO`, moving data to `<base>/.zcode/v2`. `ZCODE_DATA_DIR` overrides the `.zcode` root directly; `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` overrides the store. Native `ZCODE_DATA_BASE_DIR` is not an alias.
 The registry resolves config, detection and store from one bootstrap read. Synchronous observations re-read after coordinator awaits; store-lock and restore probes share the injected IO. Malformed, unreadable or relative settings refuse apply/overwrite/refresh as an unknown active root. Only a present explicit provider file can establish the store independently.
+Default ZCode bootstrap path resolution uses the same bounded regular-file reader as integration operations. A final symlink, FIFO or file above 4 MiB leaves the active root unknown. A missing bootstrap file or valid settings without `dataBaseDir` uses the default root; failed reads never fall back. An explicit `ZCODE_DATA_DIR` still bypasses bootstrap discovery.
 
 Owned legacy config and default-root store paths retain their fingerprints and recovery evidence after relocation: refresh refuses, disable and undo use the original file, and an older undo refuses while a different path owns the record. Unknown settings retain recognized historical recovery targets; an unrecognized prior selector must be restored before mutation. Contract: `tests/clients/integrations-current-store.test.ts`.
 
@@ -481,6 +469,14 @@ separate. Restore reconciles target intent from validated snapshot ownership wit
 sibling policy. Profile journal views retain source-store provenance for older legacy entries. A profile that is off beside a stale block is never re-enabled automatically; the CLI names its preview-then-enable recovery (`src/cli/aside-profile-recovery.ts`), and a malformed policy that falls back to all-off produces a load-time warning.
 
 The shared atomic replacement publisher also identifies explicit Remote Workspace file writes as `remote-workspace`; its isolated owner and support limits are documented in [Remote Workspace](../remote-workspace.md).
+
+## Gentle Shell home discovery
+
+The `gentle-shell` client reuses Pi's serializer/options but stamps its own ownership identity for `providers.opencodex`. The registry resolves config and detect paths from one bootstrap read per observation; export uses that same resolver. Owned-catalog refresh includes this client, while Pi's existing path and behavior remain unchanged.
+
+`src/clients/gentle-shell-path.ts` resolves the persistent launcher home from `GENTLE_SHELL_CONFIG` (default `~/.gentle-shell/config.json`) and its `home` selector. Saved custom paths win over `GENTLE_SHELL_HOME`; isolated/default selection uses that variable or `~/.gentle-shell/agent`. Malformed JSON follows the launcher's isolated fallback, but an unreadable, unsafe or oversized bootstrap refuses discovery. Relative paths (including literal `~`) refuse: a proxy cannot infer another process's working directory. One-off launcher flags are not observable by this integration.
+
+Link mode and destinations aliasing Pi's default, configured or preserved original home refuse with a Pi-integration remedy. Canonical existing ancestors and existing file identities catch directory aliases and hard-linked catalogs. The resolver never changes launcher preferences or client files. The existing writer retains responsibility for target validation, ownership, snapshots and atomic replacement.
 
 ## omo variants
 

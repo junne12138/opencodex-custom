@@ -5,7 +5,6 @@ import { applyExplicitChatReasoningWirePolicy } from "./openai-chat/reasoning-wi
 import type { AdapterRequest, IncomingMeta, ProviderAdapter } from "./base";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig, OcxUsage } from "../types";
 import { modelInList } from "../types";
-import { createInlineThinkContentSplitter, splitInlineThinkContent } from "./inline-think-tags";
 import { mapReasoningEffort } from "../reasoning-effort";
 import { debugProviderDiagnostic } from "../lib/debug";
 import { sseFieldValue } from "../lib/sse-decoder";
@@ -28,6 +27,7 @@ import {
   type InvalidToolCallDiagnostic,
 } from "./openai-chat/tool-call-validation";
 import {
+  chatContentEvents, createChatContentSplitter, splitChatContentEvents,
   createReasoningDetailSnapshotTracker,
   invalidChoicesEvent,
   invalidToolCallsEvent,
@@ -47,7 +47,8 @@ import { messagesToChatFormat } from "./openai-chat/messages";
 import { withOpenAIChatToolNames } from "./openai-chat/tool-name-registry";
 import { openAIChatTransport, stripBracketedModelSuffix } from "./openai-chat/wire";
 import { toolChoiceToChatFormat, toolsToChatFormatForProvider } from "./openai-chat/tool-schema";
-import { freeformToolsByWireName, type FreeformToolIdentity, reconcileSerializedToolCallEvents, reconcileStructuredToolCall, reconcileStructuredToolCalls, SerializedToolCallContentBuffer } from "./openai-chat/serialized-tool-call-content";
+import { freeformToolsByWireName, type FreeformToolIdentity, reconcileStructuredToolCall, reconcileStructuredToolCalls } from "./openai-chat/serialized-tool-call-content";
+import { StandaloneBareToolCallBuffer, reconcileStandaloneBareToolCallEvents } from "./openai-chat/standalone-bare-tool-calls";
 
 export { stripBracketedModelSuffix } from "./openai-chat/wire";
 export { buildOpenAIChatPassthroughRequest } from "./openai-chat/passthrough";
@@ -300,7 +301,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         sawArgumentsString: boolean;
       }
       const pendingToolCalls: PendingToolCall[] = [];
-      const toolCallContent = new SerializedToolCallContentBuffer(budget);
+      const toolCallContent = new StandaloneBareToolCallBuffer(budget, lastRequestedModelId, freeformTools);
       const heldText = (): AdapterEvent[] => toolCallContent.drain([]);
       let toolCallSeq = 0;
       const closeToolCalls = (): PendingToolCall[] => {
@@ -322,7 +323,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       // Returns "terminate" when a pending call cannot be dispatched, so every flush site
       // stops the turn instead of emitting an unusable call. `closeToolCalls()` runs first,
       // so budget reservations are released for every pending call even on the early return.
-      const flushToolCalls = function* (): Generator<AdapterEvent, "continue" | "terminate"> {
+      const flushToolCalls = function* (terminal = true): Generator<AdapterEvent, "continue" | "terminate"> {
         const calls = closeToolCalls();
         for (const call of calls) {
           // Ingest already proved `name` is a string; the typeof guard keeps this branch
@@ -335,9 +336,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             return yield* terminateWithError(unnamedToolCallEvent(pendingUsage));
           }
         }
-        // Held markup is released only now, as one batch per response: the doubled-input repair needs every call.
         const references = reconcileStructuredToolCalls(calls.map(call => ({ wireName: call.name, restoredName: toolNames.restore(call.name), argumentsText: call.args, freeformTool: freeformTools.get(call.name) })), toolCallContent.current(), !toolCallContent.releasedAnswerText && /(?:^|[/-])mimo-v2(?:\.|$)/i.test(lastRequestedModelId ?? ""));
         calls.forEach((call, index) => { call.args = references[index]!.argumentsText; });
+        yield* toolCallContent.recoverStandalone(calls.length === 0 && terminal, () => `call_${++toolCallSeq}`, name => toolNames.restore(name));
         yield* toolCallContent.drain(references);
         for (const call of calls) {
           if (!call.id) call.id = `call_${++toolCallSeq}`;
@@ -368,7 +369,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const reasoningDetailsOptIn = modelInList(provider.reasoningDetailsModels, lastRequestedModelId ?? "");
       // A gateway with no server-side reasoning parser leaves thinking inline in `content` as
       // <think> blocks, which would otherwise render as the answer. Passthrough unless opted in.
-      const inlineThink = createInlineThinkContentSplitter(provider.inlineThinkTagModels, lastRequestedModelId, budget);
+      const inlineThink = createChatContentSplitter(provider, lastRequestedModelId, budget);
       const emitContent = function* (events: AdapterEvent[]): Generator<AdapterEvent> {
         for (const event of events) {
           // Any other event keeps its place behind held text instead of overtaking it.
@@ -444,8 +445,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             const reasoningText = reasoningTextFrom(delta);
             if (reasoningText !== undefined) yield* toolCallContent.hold({ type: "reasoning_raw_delta", text: reasoningText });
           }
-          if (typeof delta.content === "string" && delta.content.length > 0) {
-            yield* emitContent(inlineThink.feed(delta.content));
+          for (const event of chatContentEvents(delta.content, provider.baseUrl, pendingUsage)) {
+            if (event.type === "error") return yield* terminateWithError(event);
+            yield* emitContent(inlineThink.feed(event));
           }
 
           const rawToolCalls = delta.tool_calls;
@@ -656,7 +658,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           yield* terminateWithError({ type: "error", message: "upstream stream ended without a terminal signal ([DONE] or finish_reason) — possible truncation" });
           return;
         }
-        if ((yield* flushToolCalls()) === "terminate") return;
+        if ((yield* flushToolCalls(sawFinish)) === "terminate") return; // A cut stream never synthesizes a bare call.
         const stopReason = stopReasonFor(finishReason);
         yield { type: "done", usage: pendingUsage, ...(stopReason ? { stopReason } : {}) };
       } catch (error) {
@@ -767,7 +769,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
         if (reasoningText !== undefined) events.push({ type: "reasoning_raw_delta", text: reasoningText });
         const contentStart = events.length;
-        if (typeof msg.content === "string") events.push(...splitInlineThinkContent(provider.inlineThinkTagModels, lastRequestedModelId, budget, msg.content));
+        const contentEvents = splitChatContentEvents(msg.content, provider, lastRequestedModelId, budget, usage);
+        if (contentEvents.some(event => event.type === "error")) return contentEvents;
+        events.push(...contentEvents);
         const contentEnd = events.length;
         const answerText = events.slice(contentStart).map(event => (event.type === "text_delta" ? event.text : "")).join("");
         // Each call holds the delta event it emitted, so the batch repair sets its arguments later.
@@ -801,7 +805,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
         const references = reconcileStructuredToolCalls(structuredCalls, answerText, /(?:^|[/-])mimo-v2(?:\.|$)/i.test(lastRequestedModelId ?? ""));
         structuredCalls.forEach((call, index) => { call.delta.arguments = references[index]!.argumentsText; });
-        reconcileSerializedToolCallEvents(events, contentStart, contentEnd, references, budget);
+        reconcileStandaloneBareToolCallEvents(events, contentStart, contentEnd, references, budget, lastRequestedModelId, freeformTools, name => toolNames.restore(name));
         const stopReason = stopReasonFor(choice.finish_reason);
         events.push({
           type: "done",

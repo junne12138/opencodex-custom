@@ -1,3 +1,4 @@
+import { anthropicProgressEnvelope, isAnthropicProgressMirror } from "../responses/anthropic-progress";
 /**
  * Claude Code outbound: internal /v1/responses output -> Anthropic Messages API shapes.
  *
@@ -11,7 +12,7 @@
  *  - errors: {type:"error", error:{type,message}}; may arrive mid-stream after HTTP 200.
  */
 import { createHash } from "node:crypto";
-import { httpStatusFromTerminalError } from "../lib/errors";
+import { httpStatusFromTerminalError, UNDECLARED_TOOL_CALL_ERROR_CODE } from "../lib/errors";
 import { isTransientUpstreamStatus } from "../lib/upstream-retry";
 import {
   isTranslatorBudgetExceededError,
@@ -81,12 +82,16 @@ export function anthropicErrorType(status: number): string {
  * (devlog/_plan/261009_claude_1m_default/010).
  */
 const CLAUDE_PROMPT_TOO_LONG_RE = /prompt is too long|input is too long for requested model/i;
-const STATED_CONTEXT_COUNTS_RE = /maximum context length is (\d+) tokens[\s\S]*?(?:resulted in|you requested) (\d+) tokens/i;
+const MAX_OVERFLOW_MESSAGE_CHARS = 64 * 1024;
+const STATED_CONTEXT_LIMIT_RE = /maximum context length is (\d+) tokens/i;
+const STATED_REQUEST_COUNT_RE = /(?:resulted in|you requested) (\d+) tokens/i;
 
 export function claudePromptTooLongMessage(message: string): string {
+  message = message.slice(0, MAX_OVERFLOW_MESSAGE_CHARS);
   if (CLAUDE_PROMPT_TOO_LONG_RE.test(message)) return message;
-  const counts = STATED_CONTEXT_COUNTS_RE.exec(message);
-  if (counts) return `prompt is too long: ${counts[2]} tokens > ${counts[1]} maximum`;
+  const limit = STATED_CONTEXT_LIMIT_RE.exec(message);
+  const requested = limit && STATED_REQUEST_COUNT_RE.exec(message.slice(limit.index + limit[0].length));
+  if (limit && requested) return `prompt is too long: ${requested[1]} tokens > ${limit[1]} maximum`;
   return `prompt is too long: ${message}`;
 }
 
@@ -151,6 +156,8 @@ export function anthropicUsage(usage: unknown, webSearchRequests = 0): Rec {
   const details = isRec(u.input_tokens_details) ? u.input_tokens_details : {};
   const cached = typeof details.cached_tokens === "number" ? details.cached_tokens : 0;
   const cacheWrite = typeof details.cache_write_tokens === "number" ? details.cache_write_tokens : 0;
+  const cacheWrite1h = typeof details.cache_write_1h_tokens === "number"
+    ? Math.max(0, Math.min(details.cache_write_1h_tokens, cacheWrite)) : undefined;
   const input = typeof u.input_tokens === "number" ? u.input_tokens : 0;
   const output = typeof u.output_tokens === "number" ? u.output_tokens : 0;
   return {
@@ -158,6 +165,9 @@ export function anthropicUsage(usage: unknown, webSearchRequests = 0): Rec {
     output_tokens: output,
     cache_read_input_tokens: cached,
     cache_creation_input_tokens: cacheWrite,
+    ...(cacheWrite1h !== undefined
+      ? { cache_creation: { ephemeral_5m_input_tokens: cacheWrite - cacheWrite1h, ephemeral_1h_input_tokens: cacheWrite1h } }
+      : {}),
     // Only successful searches are billed/counted (Anthropic contract; Claude Code cost accounting).
     ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
   };
@@ -218,10 +228,28 @@ export function sanitizeWebSearchInput(input: unknown): Rec {
 /**
  * Map a Responses `web_search_call` item to its Anthropic pair: the server_tool_use
  * input (query/queries) and the web_search_tool_result content (hits, or the error
- * object when the search failed). Shared by the SSE and JSON translation paths.
+ * object when the search failed). An item carrying `anthropic_blocks` came from Anthropic's
+ * own server-side call and maps back to those blocks verbatim (`srvtoolu_` id,
+ * `encrypted_content`, web_fetch), so the client can replay them on its next turn.
+ * Shared by the SSE, JSON and direct translation paths.
  */
-export function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resultContent: unknown; completed: boolean } {
+export function webSearchPairFromItem(item: Rec): {
+  id: string; name: string; resultType: string; input: Rec; resultContent: unknown; completed: boolean;
+} {
   const action = isRec(item.action) ? item.action : {};
+  const completed = item.status !== "failed";
+  const { use, result } = isRec(item.anthropic_blocks) ? item.anthropic_blocks : {};
+  if (isRec(use) && isRec(result) && typeof use.id === "string" && isRec(use.input)
+    && (use.name === "web_search" || use.name === "web_fetch")
+    && result.tool_use_id === use.id && result.type === `${use.name}_tool_result`) {
+    return { id: use.id, name: use.name, resultType: result.type, input: use.input, resultContent: result.content, completed };
+  }
+  const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `srvtoolu_${uuid()}`;
+  // An item emitted before `anthropic_blocks` carried a server web_fetch as `fetch_result`.
+  if (item.fetch_result !== undefined) {
+    const input = { url: typeof action.url === "string" ? action.url : "" };
+    return { id, name: "web_fetch", resultType: "web_fetch_tool_result", input, resultContent: item.fetch_result, completed };
+  }
   const queries = Array.isArray(action.queries)
     ? action.queries.filter((q): q is string => typeof q === "string" && q.length > 0)
     : [];
@@ -229,7 +257,6 @@ export function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resu
   const input = sanitizeWebSearchInput(
     queries.length > 1 ? { queries } : { query: queries[0] ?? query },
   );
-  const completed = item.status !== "failed";
   let resultContent: unknown;
   if (completed) {
     const hits: Rec[] = [];
@@ -244,8 +271,7 @@ export function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resu
   } else {
     resultContent = { type: "web_search_tool_result_error", error_code: "unavailable" };
   }
-  const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `srvtoolu_${uuid()}`;
-  return { id, input, resultContent, completed };
+  return { id, name: "web_search", resultType: "web_search_tool_result", input, resultContent, completed };
 }
 
 /**
@@ -549,7 +575,13 @@ export function responsesSseToAnthropicSse(
         terminalDelivered = true;
       };
 
+      let progressMirrorId: string | undefined;
       const handleFrame = (eventName: string, data: Rec) => {
+        const frameItem = isRec(data.item) ? data.item : null;
+        if (progressMirrorId && (data.item_id === progressMirrorId || frameItem?.id === progressMirrorId)) {
+          if (eventName === "response.output_item.done") progressMirrorId = undefined;
+          return;
+        }
         switch (eventName) {
           case "response.created":
           case "response.in_progress": {
@@ -701,7 +733,7 @@ export function responsesSseToAnthropicSse(
               const toolIndex = blockIndex++;
               emit("content_block_start", {
                 type: "content_block_start", index: toolIndex,
-                content_block: { type: "server_tool_use", id: pair.id, name: "web_search" },
+                content_block: { type: "server_tool_use", id: pair.id, name: pair.name },
               });
               emit("content_block_delta", {
                 type: "content_block_delta", index: toolIndex,
@@ -711,10 +743,10 @@ export function responsesSseToAnthropicSse(
               const resultIndex = blockIndex++;
               emit("content_block_start", {
                 type: "content_block_start", index: resultIndex,
-                content_block: { type: "web_search_tool_result", tool_use_id: pair.id, content: pair.resultContent },
+                content_block: { type: pair.resultType, tool_use_id: pair.id, content: pair.resultContent },
               });
               emit("content_block_stop", { type: "content_block_stop", index: resultIndex });
-              if (pair.completed) webSearchRequests++;
+              if (pair.completed && pair.name === "web_search") webSearchRequests++;
               break;
             }
             // Close the matching open block (message/reasoning items close implicitly on
@@ -768,6 +800,15 @@ export function responsesSseToAnthropicSse(
                 ensureBlock("thinking");
               }
               if (open?.kind === "thinking") {
+                if (env?.upd && typeof env.txt === "string") {
+                  // This plaintext was deliberately surfaced as commentary, unlike hidden reasoning.
+                  progressMirrorId = env.upd;
+                  const bytes = Buffer.byteLength(env.txt);
+                  translatorBudget.chargeRetained(bytes, { kind: "reasoning" });
+                  translatorBudget.releaseRetained(open.thinkingBufBytes ?? 0, { kind: "reasoning" });
+                  open.thinkingBuf = env.txt;
+                  open.thinkingBufBytes = bytes;
+                }
                 if (env?.sig) open.reasoningSig = env.sig;
                 if (native) open.reasoningNative = typeof item.id === "string" && item.id.length > 0 ? { enc: native, id: item.id } : { enc: native };
                 closeOpenBlock();
@@ -804,11 +845,14 @@ export function responsesSseToAnthropicSse(
             // Unclassified status-absent response.failed (relaySseWithFailedTail synthetic
             // tail) still lands on a transient 5xx here — the mid-stream reset shape maps to
             // overloaded_error by design.
+            // The undeclared-tool refusal is deterministic and proxy-owned, not an upstream
+            // condition: keep its api_error type and code instead of a retryable overload.
+            const deterministic = code === UNDECLARED_TOOL_CALL_ERROR_CODE;
             fail(
               status,
               message,
-              true,
-              code === "context_length_exceeded" ? code : undefined,
+              !deterministic,
+              deterministic || code === "context_length_exceeded" ? code : undefined,
             );
             break;
           }
@@ -969,7 +1013,8 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
   let sawToolUse = false;
   let webSearchRequests = 0;
 
-  for (const raw of output) {
+  for (const [index, raw] of output.entries()) {
+    if (index > 0 && isAnthropicProgressMirror(raw, anthropicProgressEnvelope(output[index - 1], translatorBudget))) continue;
     if (!isRec(raw)) continue;
     switch (raw.type) {
       case "message": {
@@ -1003,7 +1048,7 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
         const native = nativeEncryptedReasoning(encrypted);
         const tag = native && nativeReasoningTagFor?.(native);
         if (parts.length > 0 || env?.sig || tag) {
-          const text = parts.join("\n\n");
+          const text = env?.upd ? env.txt! : parts.join("\n\n");
           const nat = tag ? { enc: native, model, tag, ...(typeof raw.id === "string" && raw.id.length > 0 ? { id: raw.id } : {}) } : undefined;
           content.push({ type: "thinking", thinking: text, signature: env?.sig ?? encodeReasoningEnvelope({ txt: text, ...(nat ? { nat } : {}) }, translatorBudget) });
         }
@@ -1027,9 +1072,9 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
       case "web_search_call": {
         // Server-side search: emit the Anthropic pair. Does NOT set sawToolUse.
         const pair = webSearchPairFromItem(raw);
-        content.push({ type: "server_tool_use", id: pair.id, name: "web_search", input: pair.input });
-        content.push({ type: "web_search_tool_result", tool_use_id: pair.id, content: pair.resultContent });
-        if (pair.completed) webSearchRequests++;
+        content.push({ type: "server_tool_use", id: pair.id, name: pair.name, input: pair.input });
+        content.push({ type: pair.resultType, tool_use_id: pair.id, content: pair.resultContent });
+        if (pair.completed && pair.name === "web_search") webSearchRequests++;
         break;
       }
       default:

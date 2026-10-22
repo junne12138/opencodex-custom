@@ -1160,6 +1160,11 @@ async function fetchExposedModelIds(live: LiveProxy, fetchFn: ExposedModelsFetch
       if (id.length === 0) continue;
       if (id.length > EXPOSED_MODEL_ID_MAX_LENGTH) return null;
       ids.add(id);
+      const nativeId = (row as { native_id?: unknown }).native_id;
+      if (nativeId !== undefined) {
+        if (typeof nativeId !== "string" || nativeId.length > EXPOSED_MODEL_ID_MAX_LENGTH) return null;
+        if (nativeId.length > 0) ids.add(nativeId);
+      }
     }
     return ids;
   } catch {
@@ -1428,6 +1433,15 @@ export async function runDoctor(args: string[] = []): Promise<void> {
     }
   }
 
+  // #2999: which process refreshes the native main login in CODEX_HOME.
+  console.log("\nNative main refresh");
+  {
+    const { loadConfig } = await import("../config");
+    const { formatNativeMainRefreshDoctorLines, resolveNativeMainRefreshMode } = await import("../codex/native-main-refresh-mode");
+    const resolution = await resolveNativeMainRefreshMode(loadConfig());
+    for (const line of formatNativeMainRefreshDoctorLines(resolution)) console.log(line);
+  }
+
   // Mirrors `ocx status` through the same comparison rather than a second implementation:
   // two diagnostics disagreeing about whether an install is stale is worse than one (#2701).
   // No extra probe -- findLiveProxy already carried the version back.
@@ -1458,7 +1472,7 @@ export async function runDoctor(args: string[] = []): Promise<void> {
 
   // Observe-only and warning-level: a bypassed Desktop first-party install still serves the
   // CLI and every non-Desktop client, so this never records a doctor failure.
-  const desktopSystemProxyLines = formatDesktopSystemProxyLines(collectDesktopSystemProxy(doctorConfig));
+  const desktopSystemProxyLines = formatDesktopSystemProxyLines(await collectDesktopSystemProxy(doctorConfig));
   if (desktopSystemProxyLines.length > 0) {
     console.log("\nClaude Desktop first-party vs Windows system proxy");
     for (const line of desktopSystemProxyLines) console.log(line);

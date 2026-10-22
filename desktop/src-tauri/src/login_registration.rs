@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 const SERVICE: &str = "OpenCodex";
 const APP_SUFFIX: &str = "/Contents/MacOS/opencodex-desktop";
 const AUTOSTART_ARGUMENT: &str = "--autostart";
+/// `managed_by` of a job Background Task Management resubmitted through smd (#7019).
+const SERVICE_MANAGEMENT: &str = "com.apple.xpc.ServiceManagement";
 /// System Settings → General → Login Items & Extensions, where a disabled job is turned back on.
 #[cfg(target_os = "macos")]
 pub const LOGIN_ITEMS_SETTINGS: &str =
@@ -189,6 +191,13 @@ fn line_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// `/^\(submitted by smd\.\d+\)$/`: launchctl's `path` for a job smd resubmitted.
+fn smd_submitted(path: &str) -> bool {
+    path.strip_prefix("(submitted by smd.")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The registered program when the plist has the shape auto-launch writes for this app.
 fn registered_app(plist: &Value) -> Option<(&str, Option<bool>)> {
     let args = plist.get("ProgramArguments")?.as_array()?;
@@ -331,6 +340,17 @@ pub fn classify(probe: &dyn Probe, home: &Path, uid: u32, current_app: &Path) ->
             let Some(path) = line_value(&loaded, "path = ") else {
                 return LoginState::Unknown;
             };
+            // macOS 13+ Background Task Management can resubmit the user LaunchAgent through
+            // smd; launchctl then names the submitter instead of the plist (#7019). Credit it like
+            // an unloaded job: the whole registration is read again and must not have changed.
+            if smd_submitted(path)
+                && line_value(&loaded, "managed_by = ") == Some(SERVICE_MANAGEMENT)
+            {
+                return match capture(probe, &plist, &domain, current_app) {
+                    Ok(last) if last == first => LoginState::On,
+                    _ => LoginState::Unknown,
+                };
+            }
             match probe.realpath(Path::new(path)) {
                 Ok(path) if path == first.registration => LoginState::On,
                 _ => LoginState::Unknown,
@@ -507,13 +527,16 @@ mod command {
     pub(super) fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String, RunError> {
         let slot = Slot::take().ok_or(RunError::Failed)?;
         let deadline = Instant::now() + timeout;
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| RunError::Failed)?;
+        let spawn = || {
+            Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
+        let child = crate::process_spawn::with_spawn(spawn);
+        let mut child = child.map_err(|_| RunError::Failed)?;
         let readers = [drain(child.stdout.take()), drain(child.stderr.take())];
         let status = loop {
             match child.try_wait() {
@@ -559,6 +582,29 @@ mod command {
 
         #[test]
         fn a_command_past_its_deadline_holds_the_only_slot_until_it_ends() {
+            // Measure command deadlines in a fresh process: the parent's executable-fixture
+            // writers may hold the test spawn lock longer than this test's timing budget.
+            const CHILD: &str = "OCX_LOGIN_COMMAND_DEADLINE_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let output = crate::process_spawn::with_spawn(|| {
+                    Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "login_registration::command::tests::a_command_past_its_deadline_holds_the_only_slot_until_it_ends",
+                            "--nocapture",
+                        ])
+                        .env(CHILD, "1")
+                        .output()
+                })
+                .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                return;
+            }
             let started = Instant::now();
             assert_eq!(
                 run("/bin/sleep", &["1"], Duration::from_millis(50)),

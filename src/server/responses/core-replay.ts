@@ -1,3 +1,5 @@
+import { bindAnthropicRejectionPolicy } from "../../adapters/anthropic-rejection-memo";
+import { getReasoningReplayOpaqueBlobRejection } from "../../responses/reasoning-replay-cache";
 import type {
   OcxProviderContinuationOwner,
   OcxProviderContinuationState,
@@ -24,6 +26,7 @@ import {
   type NativeReasoningOwner,
   bindReasoningReplayScope,
   reasoningReplayServingIdentityChanged,
+  reasoningReplayServingIdentityChange,
   reasoningReplayItemStoreChanged,
   reasoningReplayOpaqueBlobRejectionMemoized,
 } from "../../responses/reasoning-replay-cache";
@@ -32,6 +35,7 @@ import type { CodexAuthContext } from "../../codex/auth-context";
 import { thoughtSignatureReplaySalt } from "../../responses/thought-signature-replay";
 import { randomUUID } from "node:crypto";
 import { requiresPlaintextReasoningReplay } from "../../adapters/openai-responses/passthrough";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 
 /**
  * Adapters whose continuation state must survive Codex's store:false requests.
@@ -125,11 +129,13 @@ export function bindRouteReasoningReplayScope(args: {
   if (owner) parsed._nativeReasoningBoundOwner = owner;
   else delete parsed._nativeReasoningBoundOwner;
   if (parsed._nativeReasoningReplay?.size) {
+    const rejected = new Set<string>();
     for (const [blob, tag] of parsed._nativeReasoningReplay) {
       if (!nativeReasoningTagMatches(nativeReasoningTag(owner, blob), tag)) {
-        stripNativeReasoningBlob(parsed, blob);
+        rejected.add(blob);
       }
     }
+    if (rejected.size) stripNativeReasoningBlobs(parsed, rejected);
   }
   const continuationDestinationIdentity = providerContinuationDestinationIdentity(parsed, provider);
   const continuationOwner = providerContinuationOwnerFromReplayIdentity(
@@ -154,26 +160,42 @@ export function bindRouteReasoningReplayScope(args: {
   );
   // Keep this sticky for the whole outbound request: a later auth/key rebind may compare equal
   // after the first mismatch, but it cannot make history minted by the prior route decodable.
-  if (reasoningReplayServingIdentityChanged(parsed._reasoningReplayScope)) {
-    parsed._stripReasoningEncryptedContent = true;
+  const identityChange = reasoningReplayServingIdentityChange(parsed._reasoningReplayScope);
+  if (identityChange) {
+    // Reasoning retention does not establish portability of native compacted history.
+    parsed._stripNativeCompactionEncryptedContent = true;
+    const retention = parsed._nativeReasoningRetention;
+    const mayRetainReasoning = isCanonicalOpenAiForwardProvider(provider)
+      && !identityChange.providerChanged
+      && !identityChange.destinationChanged
+      && !identityChange.adapterChanged
+      && (!identityChange.modelChanged || retention?.modelSwitch === true)
+      && (!identityChange.credentialChanged || retention?.accountSwitch === true);
+    if (!mayRetainReasoning) parsed._stripReasoningEncryptedContent = true;
+    else if (parsed._stripReasoningEncryptedContent !== true) parsed._nativeReasoningRetainedAcrossRoute = true;
     // Only a different destination or credential makes the replayed item ids unresolvable; a
     // model change on the same store keeps them.
     if (reasoningReplayItemStoreChanged(parsed._reasoningReplayScope)) {
       parsed._dropForeignReasoningItemIds = true;
     }
   }
+  const rejectionMemo = getReasoningReplayOpaqueBlobRejection(parsed._reasoningReplayScope);
+  bindAnthropicRejectionPolicy(parsed, adapterName === "anthropic" ? rejectionMemo : undefined);
   if (reasoningReplayOpaqueBlobRejectionMemoized(parsed._reasoningReplayScope)) {
-    parsed._stripReasoningEncryptedContent = true;
+    if (adapterName !== "anthropic" || rejectionMemo?.mode !== "selective") parsed._stripReasoningEncryptedContent = true;
+    parsed._stripNativeCompactionEncryptedContent = true;
     parsed._dropForeignReasoningItemIds = true;
   }
+  // Stripping is authoritative: nothing retained remains to be refused.
+  if (parsed._stripReasoningEncryptedContent === true) delete parsed._nativeReasoningRetainedAcrossRoute;
   bindProviderContinuationForRoute(parsed, continuationOwner);
 }
 
-function stripNativeReasoningBlob(parsed: OcxParsedRequest, blob: string): void {
+function stripNativeReasoningBlobs(parsed: OcxParsedRequest, rejected: ReadonlySet<string>): void {
   const input = (parsed._rawBody as { input?: unknown } | undefined)?.input;
   if (Array.isArray(input)) {
     for (const item of input) {
-      if (item && typeof item === "object" && item.type === "reasoning" && item.encrypted_content === blob) {
+      if (item && typeof item === "object" && item.type === "reasoning" && rejected.has(item.encrypted_content)) {
         delete item.encrypted_content;
         delete item.id;
       }
@@ -187,7 +209,8 @@ function stripNativeReasoningBlob(parsed: OcxParsedRequest, blob: string): void 
         const item: unknown = JSON.parse(part.signature);
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
         const reasoning = item as Record<string, unknown>;
-        if (reasoning.type !== "reasoning" || reasoning.encrypted_content !== blob) continue;
+        if (reasoning.type !== "reasoning" || typeof reasoning.encrypted_content !== "string"
+          || !rejected.has(reasoning.encrypted_content)) continue;
         delete reasoning.encrypted_content;
         delete reasoning.id;
         part.signature = JSON.stringify(reasoning);

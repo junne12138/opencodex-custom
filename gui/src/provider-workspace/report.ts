@@ -152,6 +152,7 @@ function quotaFromUnknown(quota: unknown, fallbackUpdatedAt?: number): AccountQu
           ...(finite(row.used) !== undefined ? { used: row.used as number } : {}),
           ...(finite(row.remaining) !== undefined ? { remaining: row.remaining as number } : {}),
           ...(typeof row.unit === "string" && row.unit.trim() ? { unit: row.unit.trim() } : {}),
+          ...(typeof row.modelId === "string" && row.modelId.length <= 128 ? { modelId: row.modelId } : {}),
         }];
       })
     : [];

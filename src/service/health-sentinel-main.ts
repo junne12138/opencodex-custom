@@ -12,11 +12,10 @@
  * - Windows reuses ids quickly, so the sentinel opens a handle on its parent at startup, accepts it
  *   only if that process was created before the sentinel, and terminates through the handle
  *   (health-sentinel-windows.ts). While the handle is open the id cannot be reused.
- * - POSIX allocates ids sequentially, and the sentinel's live `process.ppid` changes the moment
- *   its parent exits, before the exited parent can be reaped and its id freed. It is the last check
- *   before `kill`. Reuse inside that window needs the parent to exit, be reaped, and the id space to
- *   wrap completely (99,999 ids on macOS, `pid_max` on Linux) between two adjacent syscalls; that
- *   residual is accepted and documented in structure/ops/service-health-recovery.md.
+ * - Linux holds a pidfd after rechecking the live parent relationship, and signals that fd.
+ *   Only unsupported kernels/architectures retain the live-ppid fallback used by macOS.
+ * - macOS checks the live parent id immediately before SIGKILL; PID reuse between those two
+ *   syscalls remains a documented residual (structure/ops/service-health-recovery.md).
  *
  * SIGKILL rather than SIGTERM: a proxy whose event loop is stuck cannot run its own SIGTERM
  * handler, and systemd counts a SIGTERM death as a clean exit that `Restart=on-failure` does not
@@ -38,7 +37,7 @@ import {
   type HealthProbeOutcome,
   type HealthSentinelTiming,
 } from "./health-sentinel-policy";
-import { probeHealth, type HealthProbeTarget } from "./health-sentinel-probe";
+import { probeHealth, probeUrlHost, type HealthProbeTarget } from "./health-sentinel-probe";
 
 export const HEALTH_SENTINEL_ENV = {
   targetPid: "OCX_HEALTH_SENTINEL_TARGET_PID",
@@ -80,6 +79,8 @@ export type HealthSentinelDeps = {
   isTargetGone(): boolean;
   /** Bind to the target once at startup; a failure stands the sentinel down. */
   bindTarget(): { ok: true } | { ok: false; reason: string };
+  /** Release the process owner on every exit, refusal, cancellation or exception. */
+  closeTarget(): void;
   /** Terminate the bound target, re-proving it is still the target at the last moment. */
   terminateTarget(): TerminateResult;
   /** Run under the ownership mutation lease, released on return; "busy" when it could not be taken promptly. */
@@ -143,7 +144,17 @@ type Attempt =
   | { kind: "gone" }
   | { kind: "intent"; entry: RecoveryEntry };
 
+function matchesProbeTarget(runtime: SentinelRuntimeRecord | null, pid: number, target: HealthProbeTarget): boolean {
+  return runtime !== null && runtime.pid === pid && !runtime.sibling
+    && runtime.port === target.port && probeUrlHost(runtime.hostname) === target.hostname;
+}
+
 export async function runHealthSentinel(deps: HealthSentinelDeps): Promise<HealthSentinelResult> {
+  try { return await observeHealthSentinel(deps); }
+  finally { deps.closeTarget(); }
+}
+
+async function observeHealthSentinel(deps: HealthSentinelDeps): Promise<HealthSentinelResult> {
   const timing: HealthSentinelTiming = { ...DEFAULT_HEALTH_SENTINEL_TIMING, ...deps.timing };
   const standDown = (reason: string): HealthSentinelResult => {
     deps.log(`standing down: ${reason} (pid ${deps.targetPid})`);
@@ -162,12 +173,18 @@ export async function runHealthSentinel(deps: HealthSentinelDeps): Promise<Healt
     recoveryHistory: history,
     timing,
   });
+  let pinnedTarget: HealthProbeTarget | null = null;
   for (;;) {
     if (deps.isTargetGone()) return { outcome: "target_exited" };
     const runtime = deps.readRuntime();
     if (!runtime || runtime.pid !== deps.targetPid) return standDown("the runtime record no longer names the watched process");
     if (runtime.sibling) return standDown("the watched process is a sibling proxy");
-    const outcome = await raceGone(deps.probe({ hostname: runtime.hostname ?? "", port: runtime.port }, timing.probeTimeoutMs), exitSignal);
+    const hostname = probeUrlHost(runtime.hostname);
+    if (hostname === null) return standDown("the recorded bind address is not numeric; DNS names cannot authorize recovery");
+    const target: HealthProbeTarget = pinnedTarget ?? { hostname, port: runtime.port };
+    if (!matchesProbeTarget(runtime, deps.targetPid, target)) return standDown("the recorded probe endpoint changed");
+    pinnedTarget = target;
+    const outcome = await raceGone(deps.probe(target, timing.probeTimeoutMs), exitSignal);
     if (outcome === GONE) return { outcome: "target_exited" };
     const wasArmed = policy.state().armed;
     const decision = policy.observe(outcome);
@@ -178,7 +195,7 @@ export async function runHealthSentinel(deps: HealthSentinelDeps): Promise<Healt
         // Everything that could have changed during the probe is re-read under the lease.
         if (deps.isTargetGone()) return { kind: "gone" };
         const current = deps.readRuntime();
-        if (!current || current.pid !== deps.targetPid || current.port !== runtime.port || current.sibling) {
+        if (!matchesProbeTarget(current, deps.targetPid, target)) {
           return { kind: "stand_down", reason: "the runtime record changed while the target was unresponsive" };
         }
         // Persist first: an attempted recovery must count toward the cap, and on Windows this
@@ -202,7 +219,10 @@ export async function runHealthSentinel(deps: HealthSentinelDeps): Promise<Healt
         const { entry } = attempt;
         // The lease, history and log work above takes time. Re-check that the evidence is still
         // fresh right before the irreversible step: a proxy that recovered meanwhile must not be
-        // killed on old observations. A clock that ran backwards makes the evidence stale too.
+        // killed on old observations. A clock that ran backwards makes the evidence stale too. The
+        // final runtime-record read is included before the freshness check so time spent on it
+        // cannot authorize termination on stale observations.
+        const finalRuntime = deps.readRuntime();
         const evidenceAge = deps.now() - outcome.endedAt;
         if (evidenceAge < 0 || evidenceAge > timing.maxEvidenceAgeMs || deps.isTargetGone()) {
           settle({ ...entry, state: "skipped" });
@@ -210,6 +230,10 @@ export async function runHealthSentinel(deps: HealthSentinelDeps): Promise<Healt
           deps.log(`discarding stale evidence (${Math.round(evidenceAge / 1000)}s old) for pid ${deps.targetPid}; observing again`);
           if (await raceGone(deps.sleep(policy.nextDelayMs()), exitSignal) === GONE) return { outcome: "target_exited" };
           continue;
+        }
+        if (!matchesProbeTarget(finalRuntime, deps.targetPid, target)) {
+          settle({ ...entry, state: "skipped" });
+          return standDown("the recorded probe endpoint changed before termination");
         }
         const result = deps.terminateTarget();
         if (result === "not_target") {
@@ -329,6 +353,7 @@ export function readSentinelRuntime(path: string): SentinelRuntimeRecord | null 
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     const { pid, port, hostname } = parsed;
+    if (hostname !== undefined && typeof hostname !== "string") return null;
     if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return null;
     if (typeof port !== "number" || !Number.isSafeInteger(port) || port <= 0 || port > 65_535) return null;
     return { pid, port, ...(typeof hostname === "string" ? { hostname } : {}), sibling: parsed.siblingOfPort !== undefined };
@@ -388,59 +413,72 @@ export async function runHealthSentinelProcess(env: NodeJS.ProcessEnv = process.
     if (opened.ok) windowsHandle = opened.handle;
     else windowsBindFailure = opened.reason;
   }
+  let linuxHandle: import("./health-sentinel-linux").ParentPidfd | null = null;
+  let linuxBindFailure: string | null = null;
+  if (process.platform === "linux") {
+    const { openParentPidfd } = await import("./health-sentinel-linux");
+    const opened = openParentPidfd(targetPid, () => !gone && process.ppid === targetPid);
+    if (opened.kind === "bound") linuxHandle = opened.handle;
+    else if (opened.kind === "refused") linuxBindFailure = opened.reason;
+    else appendBoundedLog(logPath, `pidfd unavailable: ${opened.reason}; using live parent PID check`);
+  }
   const lag = startLagMonitor();
-  const result = await runHealthSentinel({
-    targetPid,
-    now: Date.now,
-    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-    probe: async (target, timeoutMs) => {
-      lag.reset();
-      const outcome = await probeHealth(target, timeoutMs);
-      return outcome.kind === "timeout" ? { ...outcome, sentinelLagMs: lag.read() } : outcome;
-    },
-    readRuntime: () => readSentinelRuntime(runtimePath),
-    targetExited,
-    isTargetGone: () => gone || (windowsHandle?.exited() ?? false),
-    bindTarget: () => {
-      // POSIX: Bun reads the parent id live, and it stops naming the proxy once the proxy exits.
-      // Windows: it is the creating parent's id, so the handle below carries the identity.
-      if (process.ppid !== targetPid) return { ok: false, reason: "the sentinel is not the watched process's child" };
-      if (process.platform !== "win32") return { ok: true };
-      return windowsHandle ? { ok: true } : { ok: false, reason: windowsBindFailure ?? "the parent process cannot be opened" };
-    },
-    terminateTarget: () => {
-      if (process.platform === "win32") {
-        if (!windowsHandle) return "failed";
-        return windowsHandle.terminate(1) ? "terminated" : "failed";
-      }
-      if (gone || process.ppid !== targetPid) return "not_target";
-      try {
-        process.kill(targetPid, "SIGKILL");
-        return "terminated";
-      } catch {
-        return "failed";
-      }
-    },
-    withOwnershipLease: run => {
-      let lease: { release(): void };
-      try {
-        lease = acquireOwnershipMutationLease(statePaths, { waitMs: LEASE_WAIT_MS, processImage: () => null });
-      } catch {
-        return "busy";
-      }
-      try { return run(); } finally { lease.release(); }
-    },
-    readHistory: () => {
-      const entries = readRecoveryEntries(historyPath);
-      return entries === null ? null : countedRecoveryTimes(entries);
-    },
-    writeHistory: entry => writeRecoveryEntry(historyPath, entry),
-    log: line => appendBoundedLog(logPath, line),
-    timing: parseTimingOverride(env[HEALTH_SENTINEL_ENV.timing]),
-  });
-  lag.stop();
-  windowsHandle?.close();
-  void result;
+  try {
+    await runHealthSentinel({
+      targetPid,
+      now: Date.now,
+      sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+      probe: async (target, timeoutMs) => {
+        lag.reset();
+        const outcome = await probeHealth(target, timeoutMs);
+        return outcome.kind === "timeout" ? { ...outcome, sentinelLagMs: lag.read() } : outcome;
+      },
+      readRuntime: () => readSentinelRuntime(runtimePath),
+      targetExited,
+      closeTarget: () => { linuxHandle?.close(); windowsHandle?.close(); },
+      isTargetGone: () => gone || (windowsHandle?.exited() ?? false),
+      bindTarget: () => {
+        // POSIX: Bun reads the parent id live, and it stops naming the proxy once the proxy exits.
+        // Windows: it is the creating parent's id, so the handle below carries the identity.
+        if (process.ppid !== targetPid) return { ok: false, reason: "the sentinel is not the watched process's child" };
+        if (linuxBindFailure) return { ok: false, reason: linuxBindFailure };
+        if (process.platform !== "win32") return { ok: true };
+        return windowsHandle ? { ok: true } : { ok: false, reason: windowsBindFailure ?? "the parent process cannot be opened" };
+      },
+      terminateTarget: () => {
+        if (process.platform === "win32") {
+          if (!windowsHandle) return "failed";
+          return windowsHandle.terminate(1) ? "terminated" : "failed";
+        }
+        if (gone || process.ppid !== targetPid) return "not_target";
+        if (linuxHandle) return linuxHandle.terminate();
+        try {
+          process.kill(targetPid, "SIGKILL");
+          return "terminated";
+        } catch {
+          return "failed";
+        }
+      },
+      withOwnershipLease: run => {
+        let lease: { release(): void };
+        try {
+          lease = acquireOwnershipMutationLease(statePaths, { waitMs: LEASE_WAIT_MS, processImage: () => null });
+        } catch {
+          return "busy";
+        }
+        try { return run(); } finally { lease.release(); }
+      },
+      readHistory: () => {
+        const entries = readRecoveryEntries(historyPath);
+        return entries === null ? null : countedRecoveryTimes(entries);
+      },
+      writeHistory: entry => writeRecoveryEntry(historyPath, entry),
+      log: line => appendBoundedLog(logPath, linuxHandle && line.startsWith("watching pid ") ? `${line} (pidfd)` : line),
+      timing: parseTimingOverride(env[HEALTH_SENTINEL_ENV.timing]),
+    });
+  } finally {
+    lag.stop();
+  }
   return 0;
 }
 

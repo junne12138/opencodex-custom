@@ -2,12 +2,12 @@
 
 ## Client rate-limit retry advice
 
-With a valid delay, `src/bridge/internal.ts` maps typed HTTP 429 `rate_limit_error` codes
-`resource_exhausted`, `rate_limit_exceeded`, and `slow_down` to `rate_limit_exceeded`.
-`src/lib/retry-delay.ts` formats typed and message-only rate-limit advice with the longest
-lower bound first; competing original hints are retained under an explicit provider-detail label.
-Other explicit verdicts, proxy replay budgets and event ordering are unchanged. This creates
-no reasoning/history item; client retry policy, Grok HTTP status and combo preflight stay intact.
+With a valid delay, `src/bridge/internal.ts` maps typed HTTP 429 `rate_limit_error` codes `resource_exhausted`, `rate_limit_exceeded`, and `slow_down` to `rate_limit_exceeded`. `src/lib/retry-delay.ts` formats typed and message-only rate-limit advice with the longest lower bound first; competing original hints are retained under an explicit provider-detail label. Other explicit verdicts, proxy replay budgets and event ordering are unchanged. Signed Anthropic progress follows the [progress-update contract](../providers/anthropic-progress.md). This creates no reasoning/history item; client retry policy, Grok HTTP status and combo preflight stay intact.
+
+## Adapter incomplete reasons
+
+`src/bridge/sse.ts`, `src/bridge/response-json.ts`, and `src/protocols/encoders/adapter-events.ts` normalize explicit incomplete reasons with `truncationReasonFor(reason) ?? reason`: known output-limit aliases become `max_output_tokens`, and refusal/filter aliases become `content_filter`. `src/responses/incomplete-reason.ts` applies the same classifier to native Responses JSON and SSE delivery in `src/server/responses/passthrough-delivery.ts` and to WebSocket frames in `src/server/responses/codex-ws-wire.ts`, including native control chains. It copies only changed `incomplete_details.reason` metadata, leaving output content and all other response fields intact. The compaction parser in `src/adapters/openai-responses/passthrough.ts` also normalizes its internal incomplete event. `tests/responses/incomplete-reason-normalization.test.ts` covers native HTTP delivery, WS terminal normalization and both adapter parser formats.
+Unknown reasons remain verbatim, including `adapter_eof`, `max_messages`, and `steered`; message, retryability, usage, and incomplete status are preserved. `tests/adapters/bridge-nonstreaming-terminal.test.ts` covers both Responses projections and real passthrough parsing; the direct Chat and Messages parity suites cover the client-wire outcomes.
 
 ## Compaction image input
 
@@ -61,6 +61,7 @@ stays unpinned. `tests/providers/alibaba-token-plan-wire-defaults.test.ts` cover
 replay flag.
 
 Trusted custom Responses relays may opt into `preserveResponsesInputItemIds` and `preserveResponsesMessageMetadata` for launcher replay (#6220). Ordinary destinations still strip IDs when `store: false` and private `internal_chat_message_metadata_passthrough`; xAI custom-call ID repair remains active.
+Google metadata follows the [destination-scoped replay projection](../providers/google.md#google-tool-call-thought-signature-replay).
 
 xAI keeps `openai-chat` provider-wide; Grok 4.5/4.6/4.7 subscription Responses default to native `openai-responses`, retaining namespace, hosted-search and reasoning-replay normalization. The reserved `xai` OAuth transport is name-pinned
 to the Grok CLI gateway even if its saved base URL differs; custom provider IDs do not inherit this
@@ -153,7 +154,7 @@ does not set `modelResponsesUpstreamStreaming`: client `stream: true` remains re
 streaming until a current-runtime reproduction justifies a separate bounded-JSON compatibility
 policy.
 
-Go's non-forward Responses request path moves valid `additional_tools` wrappers into top-level
+Explicitly selected Codex Lite ordinary unreferenced hosted-history lowering follows [the hosted-search continuation boundary](../providers-and-adapters.md#hosted-search-continuation-binding); non-Lite/unknown requests, native compact and public API retain structural history; portable compaction keeps its existing trigger and default projection. Go's non-forward Responses request path moves valid `additional_tools` wrappers into top-level
 `tools` through `src/adapters/opencode-go-additional-tools.ts`. Placement runs after existing
 custom/search/namespace lowering and before code-mode, compaction and final hosted-tool pruning.
 It does not recalculate wire identities or response aliases. The matcher reads the constructed
@@ -202,7 +203,7 @@ and Muse against both response formats.
 
 The canonical OpenCode Go transport derives `x-opencode-session` from the existing hashed session
 lane and the final per-model wire protocol. One conversation keeps one opaque affinity value within
-each protocol across ingress surfaces, retries, and key rotation, while Anthropic, Responses, and
+each protocol across ingress surfaces, retries, and key rotation, while Gemini, Anthropic, Responses, and
 Chat turns use separate namespaces and sibling subagents remain distinct. Destination recognition
 uses the original routed provider while the generated hash uses the settled adapter, so selecting an
 Anthropic hard pin cannot make the canonical Go destination disappear from transport recognition.
@@ -210,7 +211,7 @@ An operator-supplied header wins case-insensitively. Renamed providers are cover
 fixed key-auth destination still matches the registry; custom and lookalike URLs receive nothing.
 OpenCode Go's exact `claude-haiku-5-5`, `minimax-m2.5`, `minimax-m2.7`, `minimax-m3`, and `union-alpha`
 model ids are hard-pinned to Anthropic from every inbound; Haiku uses Messages in Go's [endpoint table](https://opencode.ai/docs/go/#endpoints).
-Sibling models retain their Chat or Responses selection. This wire choice and the session namespace
+The exact `gemini-4-argon-contributor` follows the [Go Gemini transport contract](../providers/google.md#opencode-go-gemini-transport). Siblings retain Chat or Responses. This wire choice and the session namespace
 do not assert upstream availability after the Messages endpoint accepts the session header.
 `src/adapters/openai-responses/web-search.ts` also drops the provider-rejected
 `search_content_types` and `indexed_web_access` fields from plain `web_search` tools while
@@ -293,34 +294,34 @@ There is no rule that strips whatever precedes the first dot: a legitimate tool 
 one in another provider's vocabulary, and a replayed item names a call that already happened, which
 is the worst place to guess.
 
-Membership enforcement is that flag, `enforceDeclaredToolNames`, and only the `responses` inbound
-wire enforces. Explicit enforcement with no declared catalog also refuses client tool calls rather
-than treating the missing set as permission. A routed provider that names a tool the request never declared ends the turn there:
+Membership enforcement refuses a routed provider that names a tool the request never declared:
 `src/bridge/sse.ts` emits `response.failed` and `src/bridge/response-json.ts` returns a failed
 response, both carrying `undeclared client tool`. That is the #1700 contract and it stands. Codex
 executes a top-level tool call, so a hallucinated `apply_patch` — which under code mode exists only
 as a nested `tools.apply_patch(...)` helper inside `exec` — is refused before it reaches the
 runtime, where it previously surfaced as a bare `aborted` with the file untouched.
 
-The `chat` and `anthropic` inbound wires relay the call instead. This is a deliberate reversal of
-#1700's scope for those two wires, not an oversight. Both vendor specs make the client's own runner
-responsible for validating a tool call and then executing or denying it, and harnesses on those
-endpoints defer part of their catalog to conserve prompt tokens and discover the rest at runtime.
-Enforcing membership against a partial catalog killed those streams mid-turn with a 502 and cost the
-caller the whole turn. This proxy executes no tool call on any wire, so scoping enforcement off
-these two moves the decision to the party that already makes it rather than removing it.
+Translated Responses delivery enforces declared-name membership. Native passthrough computes
+`undeclaredToolGuardActive` in `passthrough-dispatch.ts` and applies it in `passthrough-delivery.ts` before continuation state.
+Chat and Anthropic retain their delivery behavior for absent, partial and hosted-only deferred catalogs.
 
-An explicitly empty catalog still authorizes nothing on the wire that enforces. A request declaring
-an empty tool list is making a statement rather than omitting one, which is how the passthrough
-guard reads it through `clientExplicitWireToolCatalog` in
-`src/server/responses/passthrough-dispatch.ts`.
+A current-turn explicit empty catalog restricts client output on managed native Chat and Messages,
+translated adapter and run-turn delivery, direct client encoders, and final hosted-search, image
+or video output. Calls outside current-turn declarations become `undeclared_tool_call` before
+client delivery or continuation state, without a successful terminal after refusal. Other current
+declarations remain usable; internal hosted-search, vision, image and advisor work stays unchanged.
+Native Messages includes inline system-message definitions, honors permanent removals and re-offered
+known definitions, and compares restored OAuth names. Hosted `server_tool_use` and `mcp_tool_use`
+input deltas are tracked separately from client-executed `tool_use` blocks.
 
-The passthrough SSE/JSON refusal is wire-scoped too: only `responses` rejects undeclared calls.
-`undeclaredToolGuardActive` still gates namespace normalization and continuation suppression on every wire,
-standing down only for `authMode: "forward"` and requests with no catalog; relayed undeclared calls are not remembered.
-
-`src/server/responses/run-turn-execution.ts`, `src/server/responses/adapter-delivery.ts`, and
-`src/server/responses/passthrough-delivery.ts` scope membership refusal from `inboundWire` for SSE and JSON alike.
+Ingress `clientDeclaredEmptyToolCatalog` (`src/server/chat-completions.ts`, `src/server/claude-messages.ts`)
+survives omission during translation. Preparation snapshots declarations after direct decoding, before hosted-tool rewrites.
+Direct Chat with `tools: []` and legacy functions reads their names from the bridge projection;
+empty and omitted catalogs need no extra projection. Explicit `tools: []` or empty `additional_tools`
+activates the restriction; replayed declarations neither activate it nor grant names. Delivery
+normalization uses those names; direct custom `exec` helpers use the bridge compiler. Refusals keep `undeclared_tool_call` in buffered envelopes and endpoint
+projections; Messages sees `api_error`, never `overloaded_error`. Caller-forward routes retain their
+exemption; `default.` normalization remains separate.
 
 ## Selection outlives the declaration check
 
@@ -396,7 +397,7 @@ Native passthrough SSE has TWO shapes, selected per request in
   The shared `createSseInspector` factory in `relay.ts` retains the complete inspection side effects,
   including the #44 late-terminal semantics.
 
-Both client readers retain a bounded, redacted message and the first structured refusal code from a bare upstream `error`. EOF synthesis also retains narrowly recognized rate-limit codes (`rate_limit_exceeded`, `rate_limit_error`) and overload codes (`server_is_overloaded`, `overloaded_error`); recognized types apply only without an explicit code.
+Both client readers retain a bounded, redacted message and the first structured refusal code from a bare upstream `error`. EOF synthesis also retains narrowly recognized rate-limit codes (`rate_limit_exceeded`, `rate_limit_error`) overload codes (`server_is_overloaded`, `overloaded_error`), and the client-refusal classes `invalid_request_error`, `authentication_error`, `permission_error`, `not_found_error` (400/401/403/404, the code repeating the class); recognized types apply only without an explicit code.
 At EOF without a real terminal they synthesize `response.failed` rather than `adapter_eof`; a code without a message still
 produces a terminal. Codex retries codes outside its fatal set, so code and message follow the same candidate precedence;
 recognized refusal copy is used only when the event has no code. A read failure after refusal reports that refusal (#5176).
@@ -463,12 +464,12 @@ Lite identity still retires the previous socket, and subsequent eligible request
 identity can reuse the new socket. Malformed native metadata retains HTTP fallback eligibility
 without rewriting its body.
 
-Canonical WS quota and response metadata preceding the first Responses event
-are projected into bounded, allowlisted HTTP headers before the response is
-committed. Later quota observations update only the captured serving account;
-they cannot retroactively change HTTP headers already sent to the client.
-Control frames remain bounded, and provider credential/cookie headers are not
-forwarded. Once a WS create may have been sent, a missing prelude, overflow or
+Canonical WS quota and response metadata preceding the first Responses event are projected into bounded, allowlisted HTTP headers before commitment.
+`src/server/responses/codex-ws-session.ts` also retains the actual `x-reasoning-included` upgrade header when Bun exposes its handshake event, promoting the bounded candidate only after `open` validates the connection. No other upgrade header is retained: request ids, model, turn state, quota and credits are response-scoped.
+`src/server/responses/codex-ws-metadata.ts` rejects malformed or oversized raw headers and connection-nominated inclusion headers without changing transport failure or replay policy. Each canonical exchange starts from that connection signal; its own prelude metadata wins, including an explicit `false` value, and no prior exchange's metadata carries over. No signal is inferred from a model, configuration or encrypted input, and usage numbers are unchanged.
+Later metadata remains in the SSE body, while quota observations update only the captured serving account; neither changes committed HTTP headers. The pre-output hold freezes the same snapshot at its first Responses event. A client-facing WebSocket upgrade is already complete before upstream dispatch and cannot acquire this HTTP/SSE response header retroactively.
+`tests/responses/codex-ws-handshake.test.ts` and `tests/responses/codex-ws-handshake-validation.test.ts` cover the native loopback, reuse, bounds and failed-upgrade boundaries. Control frames remain bounded, and provider credential/cookie headers are not forwarded.
+Once a WS create may have been sent, a missing prelude, overflow or
 disconnect settles as a non-replayable gateway status before the first Responses
 event, or as an errored SSE body after it, rather than as a retryable fetch
 failure, so HTTP fallback cannot duplicate that inference. The one exception is a
@@ -526,11 +527,10 @@ request-log accounting without promoting a truncated repair candidate. Terminal 
 
 > Decision record: [ADR-0044](../decisions/ADR-0044-responses-http-sse.md)
 
-
 ## Inbound history and code-mode shell wire repairs
 
-Inbound function-call history with a missing JSON object prefix is repaired for every provider when
-restoring it produces an object; other malformed argument strings replay as `{}` (`src/responses/parser.ts`).
+OpenGateway result-array and image-detail projection follows the [OpenGateway transport contract](../providers/opengateway.md).
+Inbound function-call history with a missing JSON object prefix is repaired for every provider when restoring it produces an object. A terminal MiMo `</function></tool_call>` suffix is removed only when the remaining text parses as an object unchanged or after restoring a closing brace or quote and brace. Valid JSON containing these tags stays opaque; unrelated malformed arguments replay as `{}` without logging their content (`src/responses/parser.ts`). Regression coverage lives in `tests/responses/responses-mimo-envelope.test.ts`.
 Function-wrapper restoration supports `default.`-prefixed `exec` and `apply_patch` aliases while
 retaining the existing ambiguity and foreign-grammar boundaries.
 
