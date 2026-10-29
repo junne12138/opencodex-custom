@@ -5,8 +5,7 @@ description: Provider entries, authentication, endpoints, model catalogs, quotas
 
 <!-- Created: 2026-10-16; Updated: 2026-10-18; Version: 1.1 (Vertex endpoint note) -->
 
-A provider tells opencodex where a model lives, which wire adapter it speaks, and how requests are
-authenticated.
+A provider tells opencodex where a model lives, which wire adapter it speaks, and how requests are authenticated.
 
 ## DeepSeek: tokens versus image bytes
 

@@ -6,8 +6,10 @@ import {
   updateAccountQuota,
   getAccountQuota,
   clearAccountQuota,
+  isCodexQuotaExhausted,
   type WhamUsageResponse,
 } from "../../src/codex/quota";
+import { computeCodexUsageScore } from "../../src/codex/routing/cooldown-math";
 
 describe("rate-limit reset credits", () => {
   describe("parseUsageQuota", () => {
@@ -76,6 +78,15 @@ describe("rate-limit reset credits", () => {
         remaining: 7285.173254966736,
         unit: "credit",
       }]);
+    });
+
+    it("uses Business monthly credits for routing and exhaustion", () => {
+      expect(computeCodexUsageScore({
+        customWindows: [{ label: "Business monthly credits", percent: 73 }],
+      }, "business")).toBe(73);
+      expect(isCodexQuotaExhausted({
+        customWindows: [{ label: "Business monthly credits", percent: 100 }],
+      }, "business")).toBe(true);
     });
 
     it("returns null when neither rate_limit nor credits exist", () => {

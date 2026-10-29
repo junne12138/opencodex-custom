@@ -186,9 +186,6 @@ describe("codex routing", () => {
     expect(computeCodexUsageScore({ weeklyPercent: 15, monthlyPercent: 91 })).toBe(91);
     expect(computeCodexUsageScore({ weeklyPercent: 15, monthlyPercent: 20, shortPercent: 92 })).toBe(92);
     expect(computeCodexUsageScore({ weeklyPercent: 15 })).toBe(15);
-    expect(computeCodexUsageScore({
-      customWindows: [{ label: "Business monthly credits", percent: 73 }],
-    }, "business")).toBe(73);
   });
 
   test("a short-only snapshot is unknown usage, not zero usage", () => {
@@ -463,9 +460,6 @@ describe("codex routing", () => {
     expect(isCodexQuotaExhausted({ weeklyPercent: 99.9 }, "plus")).toBe(false);
     expect(isCodexQuotaExhausted({ weeklyPercent: 100 }, "plus")).toBe(true);
     expect(isCodexQuotaExhausted({ monthlyPercent: 100 }, "plus")).toBe(true);
-    expect(isCodexQuotaExhausted({
-      customWindows: [{ label: "Business monthly credits", percent: 100 }],
-    }, "business")).toBe(true);
     expect(isCodexQuotaExhausted({ weeklyPercent: 100, monthlyPercent: 20 }, "free")).toBe(false);
     expect(isCodexQuotaExhausted({ weeklyPercent: 20, monthlyPercent: 100 }, "go")).toBe(true);
   });

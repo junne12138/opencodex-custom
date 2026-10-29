@@ -870,7 +870,6 @@
     "cursor-uncallable-quarantine.test.ts": "providers/cursor",
     "cursor-vision-wire-harness.test.ts": "providers/cursor",
     "custom-model-catalog-migration.test.ts": "codex-integration",
-    "custom-quota.test.ts": "providers",
     "custom-tool-compat.test.ts": "responses",
     "cyber-policy-error-fidelity.test.ts": "providers",
     "dashboard-sidecar-codex-write.test.ts": "gui",
