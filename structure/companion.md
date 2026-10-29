@@ -73,7 +73,7 @@ when account readers report no windows; a `custom:quota-query` report may coexis
 windows. These rows stay separate from key/account measurements and never create an account.
 The native panel models in `app/Sources/NativeTray/Models.swift` decode optional `creditsUsd`
 amounts, and `app/Sources/NativeTray/UsageSections.swift` displays the provider quota and remaining
-USD balance, including a measured zero. Missing reports retain the unavailable/no-data state.
+USD balance, including measured zero and negative overage balances. Missing reports retain the unavailable/no-data state.
 
 Native panel provider headers carry the dashboard's own marks. `desktop/src-tauri/src/provider_icons.rs`
 embeds the SVG files from `gui/public/provider-icons` and mirrors the alias table and paint modes of

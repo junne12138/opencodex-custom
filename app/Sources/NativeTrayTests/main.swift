@@ -98,9 +98,9 @@ check(compass.providers[0].accounts.isEmpty, "Provider quota never fabricates an
 let zeroBalance = try decode(["providers": [["id": "compass", "label": "Compass", "unavailable": false,
     "accounts": [], "quotaWindows": [["id": "balance", "label": "Balance", "creditsUsd": ["remaining": 0]]]]]])
 check(zeroBalance.providers[0].quotaWindows![0].balanceText == "$0.00 remaining", "Zero balance is a known measurement")
-let invalidBalance = try decode(["providers": [["id": "compass", "label": "Compass", "unavailable": false,
+let overdrawnBalance = try decode(["providers": [["id": "compass", "label": "Compass", "unavailable": false,
     "accounts": [], "quotaWindows": [["id": "balance", "label": "Balance", "creditsUsd": ["remaining": -1]]]]]])
-check(invalidBalance.providers[0].quotaWindows![0].balanceText == nil, "Invalid balances stay unavailable")
+check(overdrawnBalance.providers[0].quotaWindows![0].balanceText == "-$1.00 remaining", "Overdrawn balances remain visible")
 
 // Quota bars use the dashboard's severity thresholds and keep a spoken value.
 check(NativeTrayFormat.severity(69.9) == .normal && NativeTrayFormat.severity(70) == .warn, "Warn at 70%")

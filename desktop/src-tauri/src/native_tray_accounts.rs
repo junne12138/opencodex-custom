@@ -186,7 +186,10 @@ pub fn apply_provider_quota(row: &mut Value, report: &Value) {
         return;
     };
     let mut rows = windows(quota, "");
-    if let Some(remaining) = number(&quota["creditsUsd"]["remaining"]) {
+    if let Some(remaining) = quota["creditsUsd"]["remaining"]
+        .as_f64()
+        .filter(|value| value.is_finite())
+    {
         let credits = json!({
             "remaining": remaining,
             "limit": number(&quota["creditsUsd"]["limit"]).filter(|limit| *limit > 0.0),
@@ -273,24 +276,26 @@ fn exhausted(quota: &Value, plan: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn provider_balance_is_independent_of_key_roster_and_preserves_zero() {
+    fn provider_balance_is_independent_of_key_roster_and_preserves_zero_and_overage() {
         let source = Source {
             name: "compass".into(),
             label: "Compass".into(),
             path: None,
             switch: None,
         };
-        let mut row = provider(&source, None, false);
-        apply_provider_quota(
-            &mut row,
-            &json!({"provider":"compass","quota":{
-            "creditsUsd":{"remaining":0,"limit":100,"used":100,"percent":100},
-            "apiKey":"must-not-copy"}}),
-        );
-        assert_eq!(row["accounts"], json!([]));
-        assert_eq!(row["quotaWindows"][0]["creditsUsd"]["remaining"], 0.0);
-        assert_eq!(row["quotaWindows"][0]["percent"], 100.0);
-        assert!(!row.to_string().contains("must-not-copy"));
+        for remaining in [0.0, -0.06] {
+            let mut row = provider(&source, None, false);
+            apply_provider_quota(
+                &mut row,
+                &json!({"provider":"compass","quota":{
+                "creditsUsd":{"remaining":remaining,"limit":100,"used":100.0-remaining,"percent":100},
+                "apiKey":"must-not-copy"}}),
+            );
+            assert_eq!(row["accounts"], json!([]));
+            assert_eq!(row["quotaWindows"][0]["creditsUsd"]["remaining"], remaining);
+            assert_eq!(row["quotaWindows"][0]["percent"], 100.0);
+            assert!(!row.to_string().contains("must-not-copy"));
+        }
     }
 
     #[test]
@@ -337,7 +342,6 @@ mod tests {
         for quota in [
             json!(null),
             json!({}),
-            json!({"creditsUsd":{"remaining":-1}}),
             json!({"creditsUsd":{"remaining":"37.5"}}),
         ] {
             let mut row = provider(&source, None, true);

@@ -130,7 +130,7 @@ public struct NativeTrayProvider: Decodable, Identifiable {
         public var fill: Double { min(100, value ?? 0) / 100 }
         public var resetDate: Date? { NativeTrayFormat.date(resetAt) }
         public var balanceText: String? {
-            guard let remaining = NativeTrayFormat.number(creditsUsd?.remaining) else { return nil }
+            guard let remaining = creditsUsd?.remaining, remaining.isFinite else { return nil }
             let balance = "\(NativeTrayFormat.usd(remaining)) remaining"
             guard let limit = NativeTrayFormat.number(creditsUsd?.limit), limit > 0 else { return balance }
             return "\(balance) / \(NativeTrayFormat.usd(limit)) total"
