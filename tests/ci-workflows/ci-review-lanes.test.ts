@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { repoPath } from "../helpers/repo-root";
@@ -166,10 +166,31 @@ describe("CI review lanes", () => {
     const scopedCondition = "github.event_name != 'pull_request' || needs.changes.outputs.ci == 'true'";
     // platform-macos is native-gated and pinned to the native condition above,
     // so it must not be read against this ci-only condition.
-    for (const jobName of ["test", "storage-policy", "gates", "keyring-smoke", "docker-smoke"]) {
+    for (const jobName of ["storage-policy", "gates"]) {
       const job = ci.jobs?.[jobName] as { needs?: string; if?: string } | undefined;
       expect(`${jobName}:${job?.needs}`).toBe(`${jobName}:changes`);
       expect(`${jobName}:${job?.if}`).toBe(`${jobName}:${scopedCondition}`);
+    }
+    // The pull-request fast lane swaps the four full shards for `test changed`; every
+    // other event keeps the shards, and `fast` is only ever true on a pull request.
+    const shards = ci.jobs?.test as { needs?: string; if?: string } | undefined;
+    expect(shards?.needs).toBe("changes");
+    expect(shards?.if).toBe("github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.fast != 'true')");
+    const changedTests = ci.jobs?.["test-changed"] as { needs?: string; if?: string } | undefined;
+    expect(changedTests?.needs).toBe("changes");
+    expect(changedTests?.if).toBe("github.event_name == 'pull_request' && needs.changes.outputs.fast == 'true'");
+    expect((ci.jobs?.changes as { outputs?: Record<string, string> } | undefined)?.outputs?.fast)
+      .toBe("${{ steps.lane.outputs.fast }}");
+    // The two smoke jobs keep the ci scope and, on a pull request only, also need their
+    // own narrow filter. Every other event still requests them unconditionally.
+    for (const [jobName, output] of [["keyring-smoke", "keyring"], ["docker-smoke", "docker"]] as const) {
+      const job = ci.jobs?.[jobName] as { needs?: string; if?: string } | undefined;
+      expect(`${jobName}:${job?.needs}`).toBe(`${jobName}:changes`);
+      expect(`${jobName}:${job?.if}`).toBe(
+        `${jobName}:github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.${output} == 'true')`,
+      );
+      expect((ci.jobs?.changes as { outputs?: Record<string, string> } | undefined)?.outputs?.[output])
+        .toBe(`\${{ steps.narrow.outputs.${output} }}`);
     }
     const macosControlIf = ci.jobs?.["macos-control"] as { needs?: string; if?: string } | undefined;
     expect(macosControlIf?.needs).toBe("changes");
@@ -182,12 +203,12 @@ describe("CI review lanes", () => {
     };
     // These job conditions use boolean operators and lowercase string comparisons.
     // Evaluate the checked-in expressions, rather than a second implementation of them.
-    const enabled = (job: string, event: string, lane: string, scope = "true", packaging = "true", native = "true", windows = "false") => {
+    const enabled = (job: string, event: string, lane: string, scope = "true", packaging = "true", native = "true", windows = "false", smoke = "true") => {
       const condition = ci.jobs[job]!.if ?? "true";
       const evaluate = new Function("github", "needs", `return (${condition});`);
       return evaluate(
         { event_name: event, event: { inputs: { lane } } },
-        { changes: { outputs: { ci: scope, packaging, native, windows } } },
+        { changes: { outputs: { ci: scope, packaging, native, windows, docker: smoke, keyring: smoke } } },
       );
     };
     for (const [event, lane, windows, control] of [
@@ -210,6 +231,16 @@ describe("CI review lanes", () => {
         expect(enabled(job, event, lane)).toBe(true);
         expect(enabled(job, event, lane, "false")).toBe(event !== "pull_request");
       }
+      // A pull request whose diff misses the smoke filters skips both smoke jobs; any
+      // other event still runs them, which is what keeps them on the release push run.
+      for (const job of ["keyring-smoke", "docker-smoke"]) {
+        expect(enabled(job, event, lane, "true", "true", "true", "false", "false")).toBe(event !== "pull_request");
+      }
+      for (const job of ["test", "gates", "storage-policy", "api-usage"]) {
+        expect(enabled(job, event, lane, "true", "true", "true", "false", "false")).toBe(true);
+      }
+      // Without the fast lane `test changed` never runs; the shards cover every event.
+      expect(enabled("test-changed", event, lane)).toBe(false);
       // macOS jobs never run on a pull request; they run after merge, on push.
       for (const job of ["platform-macos", "widget"]) {
         for (const scope of ["true", "false"]) {
@@ -266,6 +297,8 @@ describe("CI review lanes", () => {
       (aggregate.needs ?? []).map(job => [job, { result: "success" }]),
     );
     results["platform-windows"] = { result: "skipped" };
+    // Only a fast-lane pull request runs `test changed`; a dispatch keeps the full shards.
+    results["test-changed"] = { result: "skipped" };
     results["macos-control"] = { result: "skipped" };
     results["docs-site-build"] = { result: "skipped" };
     results["structure-gate"] = { result: "skipped" };
@@ -281,6 +314,7 @@ describe("CI review lanes", () => {
           CHANGES_CI: "true", CHANGES_NATIVE: "true", CHANGES_PACKAGING: packaging,
           CHANGES_DOCS: "false", CHANGES_STRUCTURE: "false",
           CHANGES_SETUP_ACTION: "false", CHANGES_REMOTE_HELPER: "false",
+          CHANGES_DOCKER: "true", CHANGES_KEYRING: "true",
         },
         deadlineMs: 5_000,
       });
@@ -359,7 +393,7 @@ describe("Windows and nightly CI contracts", () => {
         checkouts += 1;
       }
     }
-    expect(checkouts).toBe(17);
+    expect(checkouts).toBe(18);
   });
 
   test.skipIf(process.platform === "win32" || !Bun.which("jq"))("aggregate never requests Windows on a pull request and requests both diagnostic jobs nightly", async () => {
@@ -394,6 +428,7 @@ describe("Windows and nightly CI contracts", () => {
         CHANGES_CI: "true", CHANGES_NATIVE: "true", CHANGES_PACKAGING: "true",
         CHANGES_DESKTOP: "false", CHANGES_DOCS: "false", CHANGES_STRUCTURE: "false",
         CHANGES_SETUP_ACTION: "false", CHANGES_REMOTE_HELPER: "false",
+        CHANGES_DOCKER: "false", CHANGES_KEYRING: "false",
         ...(windows === undefined ? {} : { CHANGES_WINDOWS: windows }),
       };
       const result = spawnSync("bash", ["-c", `set -u\n${slice}\necho "WIN=$(expected_for platform-windows)"\necho "CTL=$(expected_for macos-control)"`], {
@@ -408,6 +443,12 @@ describe("Windows and nightly CI contracts", () => {
   test.skipIf(process.platform === "win32" || !Bun.which("git"))("Windows diff scan considers only added src/tests markers and fails closed without a parent", () => {
     const scenarios = [
       { path: "src/example.ts", before: "plain\n", after: "WIN32\n", expected: "true" },
+      // An added spawnSync line is Windows-sensitive by content, outside the path filter too (#7468).
+      { path: "tests/update/example-host-guard.test.ts", before: "plain\n", after: "const original = Bun.spawnSync;\n", expected: "true" },
+      // Process-signal code behaves differently on Windows (kill("SIGTERM") is TerminateProcess), #7484/#7502.
+      { path: "src/server/example-restart.ts", before: "plain\n", after: 'child.kill("SIGTERM");\n', expected: "true" },
+      { path: "tests/server/example-restart.test.ts", before: "plain\n", after: "expect(child.signalCode).toBe(\"SIGKILL\");\n", expected: "true" },
+      { path: "src/lib/example-stop.ts", before: "plain\n", after: "process.kill(pid, 0);\n", expected: "true" },
       { path: "tests/example.ts", before: "plain\n", after: "ordinary\n", expected: "false" },
       { path: "src/example.ts", before: "powershell\nplain\n", after: "plain\n", expected: "false" },
       { path: "docs/example.md", before: "plain\n", after: "pwsh\n", expected: "false" },
@@ -437,13 +478,19 @@ describe("Windows and nightly CI contracts", () => {
         commit();
         if (!scenario.orphan) { writeFileSync(path, scenario.after ?? scenario.before); commit(); }
         const output = join(directory, "output");
+        const summary = join(directory, "summary");
         const result = spawnSync("bash", [repoPath("scripts", "ci", "windows-sensitive-diff.sh")], {
           cwd: directory, encoding: "utf8", timeout: 5_000,
-          env: { ...process.env, EVENT_NAME: scenario.event ?? "pull_request", PATH_SELECTED: scenario.selected ?? "false", GITHUB_OUTPUT: output },
+          env: { ...process.env, EVENT_NAME: scenario.event ?? "pull_request", PATH_SELECTED: scenario.selected ?? "false", GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
         });
         expect(result.error).toBeUndefined();
         expect(result.status, result.stderr).toBe(scenario.status ?? 0);
         if (scenario.expected) expect(readFileSync(output, "utf8")).toBe(`windows=${scenario.expected}\n`);
+        // A Windows-sensitive pull request gets a non-blocking notice and summary line, and nothing
+        // else does; the PR still never runs the Windows shards (AGENTS.md CI policy).
+        const notice = (scenario.event ?? "pull_request") === "pull_request" && scenario.expected === "true";
+        expect(result.stdout.includes("::notice title=Windows-sensitive::")).toBe(notice);
+        expect(existsSync(summary) && readFileSync(summary, "utf8").includes("lane=all")).toBe(notice);
       } finally { rmSync(directory, { recursive: true, force: true }); }
     }
   }, 30_000);

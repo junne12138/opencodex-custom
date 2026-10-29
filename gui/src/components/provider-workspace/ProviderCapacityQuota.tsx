@@ -15,6 +15,7 @@ import {
 import { type QuotaWindowKey } from "../QuotaBars";
 import QuotaBars from "../QuotaBars";
 import { businessCreditWindow } from "../../business-workspace-quota";
+import { WorkBuddyCredits } from "./WorkBuddyCredits";
 
 function bcp47(locale: Locale): string {
   switch (locale) {
@@ -99,6 +100,7 @@ export function ProviderCapacityQuota({ report, pending }: { report: ProviderQuo
 
   return (
     <>
+      {primaryQuota?.workbuddyCredits && <WorkBuddyCredits credits={primaryQuota.workbuddyCredits} updatedAt={primaryQuota.updatedAt} />}
       {showsAggregate && <div className="pws-capacity-label">{t("pws.capacity.estimate")}</div>}
       {(primaryQuota || pending) && (
         <QuotaBars

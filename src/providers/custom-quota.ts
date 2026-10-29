@@ -95,7 +95,8 @@ function amountsFromResponse(
   if (percent === undefined) return null;
   if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) return null;
   if (used !== undefined && (!Number.isFinite(used) || used < 0)) return null;
-  if (remaining !== undefined && (!Number.isFinite(remaining) || remaining < 0)) return null;
+  // Signed balances represent overage; keep the debt while normalizePercent caps the bar.
+  if (remaining !== undefined && !Number.isFinite(remaining)) return null;
   return {
     ...(limit !== undefined ? { limit } : {}),
     ...(used !== undefined ? { used } : {}),

@@ -48,6 +48,8 @@ describe("rate-limit reset credits", () => {
       const quota = parseUsageQuota({
         plan_type: "business",
         rate_limit: null,
+        credits: null,
+        rate_limit_reset_credits: { available_count: 1 },
         spend_control: {
           reached: false,
           individual_limit: {
@@ -63,6 +65,8 @@ describe("rate-limit reset credits", () => {
         },
       });
 
+      expect(quota?.creditObservationUnavailable).toBe(true);
+      expect(quota?.resetCredits).toBe(1);
       expect(quota?.customWindows).toEqual([{
         label: "Business monthly credits",
         percent: 27,

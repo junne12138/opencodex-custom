@@ -110,6 +110,23 @@ describe("custom provider quota", () => {
     expect(JSON.stringify(result)).not.toContain("project-fixture");
   });
 
+  test.each([
+    { total_amount: 200, usage: 200.06, balance: -0.06 },
+    { total_amount: 200, usage: 200.06 },
+    { total_amount: 200, balance: -0.06 },
+  ])("keeps overdrawn balances visible: %j", async data => {
+    const config = compassConfig((async () => Response.json({ data })) as typeof globalThis.fetch);
+    const result = await fetchProviderQuotaReports(config, true);
+
+    expect(result.reports).toHaveLength(1);
+    const quota = result.reports[0]!.quota;
+    expect(quota.monthlyPercent).toBe(100);
+    expect(quota.creditsUsd?.limit).toBe(200);
+    expect(quota.creditsUsd?.used).toBeCloseTo(200.06);
+    expect(quota.creditsUsd?.remaining).toBeCloseTo(-0.06);
+    expect(quota.creditsUsd?.percent).toBe(100);
+  });
+
   test("supports environment-backed GET probes and provider-specific windows", async () => {
     const previous = process.env.OCX_QUOTA_FIXTURE;
     process.env.OCX_QUOTA_FIXTURE = "env-fixture";
