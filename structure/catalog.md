@@ -357,7 +357,7 @@ to route.
 
 ## Accounts, namespaces, and pool rotation
 
-Pool mode routes across main plus added Codex credentials. Key rules:
+Pool mode routes across main plus added Codex credentials. `src/codex/forward-transport-headers.ts` rewrites pool installation identifiers while serializing turn metadata as ASCII-safe JSON; Unicode paths and supplementary characters retain their decoded values without invalidating HTTP headers. `tests/codex-integration/codex-metadata-integrity.test.ts` covers header validity, body metadata consistency and idempotence. Key rules:
 
 - **A namespace is a public selector mapped to an internal target.** Generated selectors are how a
   caller names an account — the main login's selector is `main` (collision-suffixed if taken),

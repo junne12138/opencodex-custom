@@ -37,6 +37,22 @@ function minimalParsed(): OcxParsedRequest {
 }
 
 describe("Codex metadata integrity", () => {
+  test("pool metadata rewrite keeps Unicode paths safe for HTTP headers", () => {
+    const metadata = { installation_id: "caller-install", cwd: "/workspace/同步空间/项目", label: "café 😀" };
+    const wire = JSON.stringify(metadata).replace(/[\u007f-\uffff]/g,
+      ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    const headers = new Headers({ "x-codex-turn-metadata": wire });
+    isolateCodexPoolAccountHeaders(headers, accountA.chatgptAccountId);
+    const rewritten = headers.get("x-codex-turn-metadata")!;
+    expect(rewritten).toMatch(/^[\x20-\x7e]+$/);
+    expect(JSON.parse(rewritten)).toEqual({ ...metadata,
+      installation_id: deriveCodexAccountInstallationId(accountA.chatgptAccountId, metadata.installation_id) });
+    isolateCodexPoolAccountHeaders(headers, accountA.chatgptAccountId);
+    expect(headers.get("x-codex-turn-metadata")).toBe(rewritten);
+    const body = { client_metadata: { "x-codex-turn-metadata": wire } };
+    const isolated = isolateCodexPoolClientMetadata(body, accountA.chatgptAccountId) as typeof body;
+    expect(JSON.parse(isolated.client_metadata["x-codex-turn-metadata"])).toEqual(JSON.parse(rewritten));
+  });
   test("FORWARD_HEADERS includes client metadata allowlist entries", () => {
     for (const name of [
       "originator",

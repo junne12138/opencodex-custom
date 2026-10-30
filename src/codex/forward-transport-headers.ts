@@ -50,7 +50,10 @@ export function rewriteTurnMetadataInstallationId(rawMetadata: string, chatgptAc
   if (typeof record.installation_id !== "string" || !record.installation_id.trim()) return rawMetadata;
   const nextId = deriveCodexAccountInstallationId(chatgptAccountId, record.installation_id);
   if (nextId === record.installation_id) return rawMetadata;
-  return JSON.stringify({ ...record, installation_id: nextId });
+  // HTTP header values cannot contain decoded Unicode (for example a non-ASCII cwd).
+  // Escape UTF-16 code units so JSON round-trips paths and surrogate pairs losslessly.
+  return JSON.stringify({ ...record, installation_id: nextId }).replace(/[\u007f-\uffff]/g,
+    ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 export function isolateCodexPoolAccountHeaders(headers: Headers, chatgptAccountId: string): void {
