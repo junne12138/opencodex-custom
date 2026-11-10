@@ -1,3 +1,6 @@
+import { providerCredentialHeaders, mergeProviderCredentialHeaders } from "../../lib/provider-credential-headers";
+
+const CREDENTIAL_HEADERS_APPLIED = Symbol("provider credential headers applied");
 import type { NativeResponseControl } from "./native-response-control";
 import { PROVIDER_HEADER_DEADLINE as HEADER_DEADLINE, type ProviderHeaderDeadline as HeaderDeadline } from "../../lib/provider-admission-wait";
 import type { CodexWsPreOutputRefusalHold } from "./codex-ws-wire";
@@ -229,21 +232,36 @@ export function sendWithConnectionPolicy(
   const largeCodexBody = !compressed && typeof body === "string"
     && isCanonicalCodexResponsesUrl(target)
     && Buffer.byteLength(body, "utf8") >= 1024 * 1024;
-  (init as Record<symbol, (() => void) | undefined> | undefined)?.[PHYSICAL_DISPATCH]?.();
-  (init as Record<symbol, ((destination: string, headers: Headers) => void) | undefined> | undefined)?.[PHYSICAL_SEND_OBSERVER]?.(target, headers);
-  // Final headers, after plugin rewrites: an upstream can only echo what it received here, so the
-  // request log refuses any diagnostic that repeats one of these values (see request-log-terminal-status).
-  outboundCredentials().remember(headers);
-  return physicalFetch(input, {
-    ...init,
-    ...(compressed ? { body: compressed.body } : largeCodexBody ? { body: Buffer.from(body, "utf8") } : {}),
-    headers,
-    redirect: "manual",
-    ...(fresh ? { keepalive: false } : {}),
-    ...egressInit,
-    ...(decide || redirectedToLoopback ? { [EGRESS_DECIDED]: true } : {}),
-    ...{ [UPSTREAM_REWRITTEN]: true },
-  });
+  const send = () => {
+    (init as Record<symbol, (() => void) | undefined> | undefined)?.[PHYSICAL_DISPATCH]?.();
+    (init as Record<symbol, ((destination: string, headers: Headers) => void) | undefined> | undefined)?.[PHYSICAL_SEND_OBSERVER]?.(target, headers);
+    // Final headers, after plugin rewrites: an upstream can only echo what it received here, so the
+    // request log refuses any diagnostic that repeats one of these values (see request-log-terminal-status).
+    outboundCredentials().remember(headers);
+    return physicalFetch(input, {
+      ...init,
+      ...(compressed ? { body: compressed.body } : largeCodexBody ? { body: Buffer.from(body, "utf8") } : {}),
+      headers,
+      redirect: "manual",
+      ...(fresh ? { keepalive: false } : {}),
+      ...egressInit,
+      ...(decide || redirectedToLoopback ? { [EGRESS_DECIDED]: true } : {}),
+      ...{ [UPSTREAM_REWRITTEN]: true },
+    });
+  };
+  const credentialFile = egress?.provider.credentialHeadersFile;
+  const applied = (init as Record<symbol, { file: string; target: string } | undefined> | undefined)?.[CREDENTIAL_HEADERS_APPLIED];
+  if (applied && (applied.target !== target || (credentialFile !== undefined && applied.file !== credentialFile))) {
+    return Promise.reject(new Error("Provider credential scope changed during nested dispatch"));
+  }
+  if (credentialFile !== undefined && !applied) {
+    return providerCredentialHeaders(egress!.provider, target).then(credentials => {
+      mergeProviderCredentialHeaders(headers, credentials);
+      init = { ...init, [CREDENTIAL_HEADERS_APPLIED]: { file: credentialFile, target } } as RequestInit;
+      return send();
+    });
+  }
+  return send();
 }
 
 interface CodexWsExecutor { provider: OcxProviderConfig; http: typeof globalThis.fetch }

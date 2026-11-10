@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { providerCredentialHeaders, providerCredentialHeadersConfigError } from "../../src/lib/provider-credential-headers";
 import { outboundCredentials } from "../../src/lib/outbound-credential-registry";
-import { providerFetch } from "../../src/server/responses/fetch-helpers";
+import { providerFetch, sendWithConnectionPolicy } from "../../src/server/responses/fetch-helpers";
 import { providerOutboundPost } from "../../src/lib/provider-outbound";
 import { providerEditorConfigDTO, parseProviderEditorConfigDTO, providerManagementConfigError } from "../../src/server/auth-cors";
 import { configSchema } from "../../src/config/schema/config-schema";
@@ -49,6 +49,7 @@ describe("scoped provider credential files", () => {
       await expect(providerCredentialHeaders(provider, `${baseUrl}/responses`)).rejects.toThrow("HTTPS scope");
     }
     writeFileSync(path, '{"Cookie":"private-malformed');
+    await expect(providerCredentialHeaders(provider, `${baseUrl}/responses`)).rejects.toThrow("HTTPS scope");
     try { await providerCredentialHeaders(provider, `${baseUrl}/responses`); throw new Error("expected refusal"); }
     catch (error) { expect(String(error)).not.toContain("private-malformed"); }
     save({ baseUrl, headers: { Cookie: "fixture" } });
@@ -87,6 +88,24 @@ describe("scoped provider credential files", () => {
     expect(new Headers(captured!.headers).get("cookie")).toBe("session=fixture-secret");
   });
 
+  test("nested dispatch preserves credentials once and rejects destination or file changes", async () => {
+    const { provider } = fixture({ Authorization: "Bearer nested-fixture", Cookie: "session=nested-fixture" });
+    const { provider: other } = fixture();
+    let calls = 0;
+    const execute = (async (_input, init) => {
+      calls++;
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer nested-fixture");
+      expect(new Headers(init?.headers).get("cookie")).toBe("session=nested-fixture");
+      return new Response("ok");
+    }) as typeof fetch;
+    const nested = (target: string, inner = provider) => (async (_input, init) =>
+      sendWithConnectionPolicy(execute, target, init, { providerName: "fixture", provider: inner })) as typeof fetch;
+    await sendWithConnectionPolicy(nested(`${baseUrl}/responses`), `${baseUrl}/responses`, {}, { providerName: "fixture", provider });
+    await expect(sendWithConnectionPolicy(nested("https://other.example/responses"), `${baseUrl}/responses`, {}, { providerName: "fixture", provider })).rejects.toThrow("scope changed");
+    await expect(sendWithConnectionPolicy(nested(`${baseUrl}/responses`, other), `${baseUrl}/responses`, {}, { providerName: "fixture", provider })).rejects.toThrow("scope changed");
+    expect(calls).toBe(1);
+  });
+
   test("management and persisted schema accept references and editor roundtrips preserve only the path", () => {
     const { provider } = fixture();
     expect(providerManagementConfigError("fixture", provider)).toBeNull();
@@ -95,7 +114,7 @@ describe("scoped provider credential files", () => {
     const dto = providerEditorConfigDTO(config);
     expect(JSON.stringify(dto)).toContain(provider.credentialHeadersFile!);
     expect(JSON.stringify(dto)).not.toContain("fixture-secret");
-    expect(parseProviderEditorConfigDTO(dto)).not.toHaveProperty("error");
+    expect(parseProviderEditorConfigDTO(dto).ok).toBe(true);
     for (const patch of [{ credentialHeadersFile: "relative.json" }, { authMode: "forward" }, { authMode: "oauth" }, { adapter: "anthropic" }, { baseUrl: "http://gateway.example" }]) {
       const next = { ...provider, ...patch } as OcxProviderConfig;
       expect(providerCredentialHeadersConfigError(next)).not.toBeNull();

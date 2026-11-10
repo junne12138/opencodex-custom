@@ -1,3 +1,4 @@
+import { providerCredentialHeadersConfigError } from "../lib/provider-credential-headers";
 import { providerRelativeSendPathConfigError } from "../config/provider-relative-send-path";
 import { contextTierRecordConfigError, modelCapabilitiesConfigError, providerInputModalitiesConfigError } from "../config/provider-validation";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -881,6 +882,8 @@ export function providerManagementConfigError(
     const sendPathError = providerRelativeSendPathConfigError(field, raw[field]);
     if (sendPathError) return `provider ${JSON.stringify(redactSecretString(name))} ${sendPathError}`;
   }
+  const credentialHeadersError = providerCredentialHeadersConfigError(typed);
+  if (credentialHeadersError) return `provider ${JSON.stringify(redactSecretString(name))} ${credentialHeadersError}`;
   const headersError = providerHeadersConfigError(typed.headers);
   if (headersError) return `provider ${name} ${headersError}`;
   const forwardClientHeadersError = providerForwardClientHeadersConfigError(raw.forwardClientHeaders);
@@ -1146,6 +1149,7 @@ const PROVIDER_CONFIG_FIELD_POLICY = {
   modelMaxOutputTokens: "editor",
   modelCosts: "editor",
   headers: "redacted",
+  credentialHeadersFile: "editor",
   forwardClientHeaders: "editor",
   openRouterRouting: "editor",
   modelOpenRouterRouting: "editor",

@@ -243,7 +243,7 @@ export function egressTargetUrl(input: string | URL | Request): string | null {
 /** Everything a physical send needs to decide the route for the request it is about to make. */
 export interface ProviderEgressBinding {
   providerName: string;
-  provider: Pick<OcxProviderConfig, "proxy" | "noProxy">;
+  provider: Pick<OcxProviderConfig, "proxy" | "noProxy"> & Partial<Pick<OcxProviderConfig, "baseUrl" | "adapter" | "authMode" | "credentialHeadersFile">>;
 }
 
 /**

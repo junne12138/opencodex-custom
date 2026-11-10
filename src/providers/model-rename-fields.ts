@@ -79,6 +79,7 @@ export const PROVIDER_MODEL_RENAME_ROLES = {
   autoReviewModel: "none",
   autoReviewModelOverrides: "record",
   headers: "none",
+  credentialHeadersFile: "none",
   forwardClientHeaders: "none",
   openRouterRouting: "none",
   modelOpenRouterRouting: "record",

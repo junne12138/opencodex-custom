@@ -130,6 +130,7 @@ selector，而不是分配一个新名称。
 | `modelMaxOutputTokens?` | `Record<string, number>` | 正数型、按模型设置的 `openai-chat` 回退预算；精确/模式匹配优先于提供者默认值。 |
 | `modelCosts?` | `Record<string, ProviderCostOverlay>` | 按模型设置的显示价格（每 100 万 token 的美元数），以该提供者的精确上游模型 ID 为键（不是提供者标识符或路由后的 `provider/model` 标签），值为四个字段：`input`、`output`、`cacheRead`、`cacheWrite`（示例：`{ "deepseek-v4-flash": { "input": 0.14, "output": 0.28, "cacheRead": 0.0028, "cacheWrite": 0 } }`）。任何模型 ID 都是有效键——自定义提供者可以通过 `openai-chat` 适配器指向任意 OpenAI 兼容端点，即使不存在于内置目录中，本地 OpenAI 兼容和内部提供者的 ID 同样有效。用户配置的价格在 Logs 的 `~$` 和 Usage 估算中优先于内置目录；历史条目也会按当前覆盖项重新计价，因此修改价格可能改变过去的总额（回退顺序：用户配置 → jawcode 目录 → expected-price 覆盖 → 模型级厂商价格）；用户明确将所有费率设为零时，会得到已知的零费用估算；删除该模型的覆盖项即可恢复自动定价。目录中的全零价格仍会回退到下一个来源。每个费率必须是大于等于 0 的有限数字，且不超过 1,000,000（每 100 万 token 的美元数）；超出范围的条目会在管理边界被拒绝，并在加载时被丢弃。仅用于显示的估算：覆盖项不影响路由、账户选择、配额或计费。 |
 | `headers?` | `Record<string, string>` | 额外的上游请求头。会拒绝 Authorization、cookie、API key 头、嵌入换行符以及无效名称。 |
+| `credentialHeadersFile?` | `string` | 绝对路径或 `~/` 路径，指向仅当前用户可读的 JSON 凭据文件。仅支持 `openai-responses` 的 `key` 认证；可在提供者页面“编辑 JSON”中设置路径，凭据内容不进入配置或页面。 |
 | `openRouterRouting?` | `OpenRouterProviderRouting` | 默认的 OpenRouter `order`、`only` 和 `allowFallbacks` 偏好；仅对使用 `openai-chat` 的规范 OpenRouter 有效。 |
 | `modelOpenRouterRouting?` | `Record<string, OpenRouterProviderRouting>` | 精确模型 id 级别的覆盖项，会替换提供者级 OpenRouter 偏好。 |
 | `vercelGatewayRouting?` | `VercelGatewayRouting` | 默认的 Vercel AI Gateway `order`、`only` 和 `sort`（`"cost"` \| `"ttft"` \| `"tps"`）偏好；仅对使用 `openai-chat` 的规范 Vercel AI Gateway 有效。 |
@@ -608,3 +609,17 @@ Vercel AI Gateway 可以在多个底层推理提供者之间路由一个模型�
 ### `promptLengthPricing`
 
 可选字段 `promptLengthPricing` 扩展四项基础费率。`mode: "automatic"`（或省略该字段）保留目录的上下文计价规则；`mode: "flat"` 禁用这些规则。`mode: "custom"` 使用正安全整数 `thresholdTokens`、值为 `"gt"`（>）或 `"gte"`（≥）的 `comparison`，以及包含四项绝对替代费率的 `rates`。阈值统计所有提示词 token，包括缓存读取和写入，不包括输出。选中的费率适用于包括输出在内的整个请求，并在阈值两侧都取代目录上下文规则。Fast/Priority 调整在选定费率后只应用一次，并遵循目录为该模型公布的 Priority 关系；仅当目录将该关系声明为 `lower-bound`（目前为 xAI Grok）时，估算才会标记为下限；没有目录规则的模型只应用一次 Priority 倍率。可在 **Models → Price** 中配置。**Reset to automatic** 删除包括基础费率和规则在内的整个覆盖配置。旧配置保持兼容；这些设置只涉及显示的费用估算。
+
+## 凭据 Header 文件
+
+```json
+{
+  "baseUrl": "https://gateway.example/task/example/v1",
+  "headers": {
+    "Authorization": "Bearer REPLACE_LOCALLY",
+    "Cookie": "session=REPLACE_LOCALLY"
+  }
+}
+```
+
+将凭据保存在仓库外的本地文件中（POSIX 权限 `0600`），然后在提供者页面的“编辑 JSON”中设置 `"credentialHeadersFile": "~/.opencodex/gateway-credentials.json"`。文件内 `baseUrl` 必须与提供者 `baseUrl` 相同（忽略尾部斜杠）；只有相同 HTTPS origin 且位于该路径下的请求能携带凭据，重定向不会被自动跟随。每次发送时重新读取文件，缺失、无效、权限过宽或地址不匹配时拒绝发送。仅允许 Authorization、Cookie、x-api-key、x-goog-api-key、x-amz-security-token；不允许覆盖请求已有的认证 Header。若文件包含 Authorization，请移除提供者的 apiKey 并设置 `"keyOptional": true`。无 `/models` 接口的网关应设置 `"liveModels": false` 并填写静态 `models`。

@@ -511,3 +511,7 @@ timeout, cancellation and half-close; `tests/lib/optional-desktop-upstream.test.
 checks all four proxy schemes close cleanly when the production consumer sees EOF.
 
 Generic OAuth conversation ownership and request-local selection receipts follow [generic OAuth affinity](../providers/generic-account-pool.md#conversation-affinity).
+
+## Scoped provider credential headers
+
+`src/lib/provider-credential-headers.ts` reads bounded owner-only credential files and validates the configured HTTPS origin and path before merging headers. Both diagnostic sends in `src/lib/provider-outbound.ts` and inference physical sends in `src/server/responses/fetch-helpers.ts` apply this policy and use manual redirects. Inference checks the final plugin-rewritten URL; nested executors reuse the same credential binding only for the same file and destination. Credential values enter the outbound redaction registry before dispatch, while ordinary providers retain their synchronous physical-send boundary.

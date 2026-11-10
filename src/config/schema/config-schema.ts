@@ -1,3 +1,4 @@
+import { providerCredentialHeadersConfigError } from "../../lib/provider-credential-headers";
 import { MAIN_ACCOUNT_HARD_LOCK_MIN_PERCENT } from "../../codex/quota-types";
 import { validRemainingQuotaAccountIds } from "../../codex/account-use-remaining";
 import * as z from "zod/v4";
@@ -587,6 +588,8 @@ export const configSchema = z.object({
         message: tlsProfileError,
       });
     }
+    const credentialHeadersError = providerCredentialHeadersConfigError(provider);
+    if (credentialHeadersError) ctx.addIssue({ code: "custom", path: ["providers", redactSecretString(name), "credentialHeadersFile"], message: credentialHeadersError });
     const headersError = providerHeadersConfigError((provider as { headers?: unknown }).headers);
     if (headersError) {
       ctx.addIssue({

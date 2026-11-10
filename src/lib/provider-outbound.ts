@@ -1,3 +1,4 @@
+import { providerCredentialHeaders, mergeProviderCredentialHeaders } from "./provider-credential-headers";
 import { isIP } from "node:net";
 import type { OcxProviderConfig } from "../types";
 import {
@@ -14,7 +15,7 @@ import { publicProviderBaseUrl } from "./provider-url";
 
 type ProviderGetInit = Omit<RequestInit, "body" | "method" | "redirect">;
 type ProviderPostInit = ProviderGetInit & { body: string };
-type ProviderOutboundConfig = Pick<OcxProviderConfig, "baseUrl" | "allowPrivateNetwork" | "proxy" | "noProxy"> & {
+type ProviderOutboundConfig = Pick<OcxProviderConfig, "baseUrl" | "allowPrivateNetwork" | "proxy" | "noProxy" | "credentialHeadersFile"> & Partial<Pick<OcxProviderConfig, "adapter" | "authMode">> & {
   fetch?: typeof globalThis.fetch;
 };
 export interface ProviderOutboundDependencies {
@@ -231,6 +232,11 @@ async function providerOutboundRequest(
   // See PROVIDER_OUTBOUND_DEFAULT_USER_AGENT: this wrapper only carries proxy-originated
   // diagnostic traffic, so it identifies itself unless the caller already did.
   const init = withDefaultOutboundUserAgent(rawInit);
+  if (provider.credentialHeadersFile !== undefined) {
+    const headers = new Headers(init.headers);
+    mergeProviderCredentialHeaders(headers, await providerCredentialHeaders(provider, url));
+    init.headers = headers;
+  }
   const assertSendAllowed = () => {
     if (dependencies.beforeSend?.() === false) throw new ProviderOutboundSendCancelledError("provider credential changed before send");
   };
