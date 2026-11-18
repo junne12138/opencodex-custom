@@ -12,6 +12,7 @@ import { tryAdmitTurn } from "../lifecycle";
 import type { RequestLogContext } from "../request-log";
 import { createSseInspector } from "../relay";
 import type { HandleResponsesOptions } from "./core-options";
+import { ESTIMATED_USAGE_HEADER } from "./estimated-usage";
 
 type HandleResponses = (
   req: Request,
@@ -24,8 +25,8 @@ export interface JevModelInvokerContext {
   /** The request that owns the combo; only its spend root is reused, never its headers. */
   req: Pick<Request, "headers">;
   config: OcxConfig;
-  /** Parent options: only the resolved admission scope and Codex auth policy cross over. */
-  options: Pick<HandleResponsesOptions, "admission" | "admissionScope" | "codexAuthPolicy">;
+  /** Parent options: only the resolved admission scope, Advisor caller policy and Codex auth policy cross over. */
+  options: Pick<HandleResponsesOptions, "admission" | "admissionScope" | "advisorAdmissionPolicy" | "codexAuthPolicy">;
   handleResponses: HandleResponses;
 }
 
@@ -154,6 +155,8 @@ export function createJevModelInvoker(context: JevModelInvokerContext): JevModel
         // capability-authenticated internal call carries the caller's scope while its own
         // admission is the host's broad key.
         ...(context.options.admissionScope ? { admissionScope: context.options.admissionScope } : {}),
+        // The parent's ingress snapshot; without it the detached turn would re-read mutable config (#7859).
+        ...(context.options.advisorAdmissionPolicy ? { advisorAdmissionPolicy: context.options.advisorAdmissionPolicy } : {}),
         ...(context.options.codexAuthPolicy ? { codexAuthPolicy: context.options.codexAuthPolicy } : {}),
         // Explicit nulls: handleResponses captures caller credentials only when these are undefined.
         callerDirectAuth: null,
@@ -181,8 +184,12 @@ export function createJevModelInvoker(context: JevModelInvokerContext): JevModel
           if (!isRecord(parsed)) throw new JevModelInvokeError("malformed", "decision response is not an object");
           return terminalResult(parsed, "");
         })();
-      usage = result.usage;
-      return quotaOmitted ? { ...result, quotaOmitted: true } : result;
+      // A marked response carries an estimate for a client's display, never spend evidence.
+      const estimated = response.headers.has(ESTIMATED_USAGE_HEADER);
+      const { usage: bodyUsage, ...withoutUsage } = result;
+      const settled = estimated ? withoutUsage : result;
+      usage = estimated ? undefined : bodyUsage;
+      return quotaOmitted ? { ...settled, quotaOmitted: true } : settled;
     } finally {
       // No final log row is written for this detached context, so settle its spend here.
       childLog.spendTracker?.settle(childLog.usage ?? (usage
